@@ -14,6 +14,7 @@ use userlib::{kipc, TaskDumpRegion, UnwrapLite};
     armv8m,
     not(any(
         target_board = "lpcxpresso55s69",
+        target_board = "okdo-e1",
         target_board = "rot-carrier-1",
         target_board = "rot-carrier-2",
     ))

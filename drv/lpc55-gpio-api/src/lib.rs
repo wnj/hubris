@@ -13,9 +13,9 @@ use zerocopy::AsBytes;
 // LPC55S2x variant only has 36
 //
 // These are encoded so port 0 goes from 0 - 31 and port 1
-// goes 0 - 64
+// goes 32 - 64
 cfg_if::cfg_if! {
-    if #[cfg(any(target_board = "lpcxpresso55s69"))] {
+    if #[cfg(any(target_board = "lpcxpresso55s69", target_board = "okdo-e1"))] {
         #[derive(Copy, Clone, Debug, FromPrimitive, AsBytes, Deserialize, Serialize, SerializedSize)]
         #[repr(u32)]
         pub enum Pin {

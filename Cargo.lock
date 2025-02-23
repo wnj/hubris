@@ -3777,6 +3777,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "okdo-e1"
+version = "0.1.0"
+dependencies = [
+ "abi",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "lpc55-pac",
+ "lpc55-rot-startup",
+ "unwrap-lite",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
