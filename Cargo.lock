@@ -882,6 +882,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-stm32g030-proto"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "stm32g0",
+]
+
+[[package]]
 name = "demo-stm32h7-nucleo"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,65 @@
+name = "demo-stm32g030-proto"
+target = "thumbv6m-none-eabi"
+chip = "../../chips/stm32g0"
+memory = "memory-g030x6.toml"
+board = "stm32g030-proto"
+
+[kernel]
+name = "demo-stm32g030-proto"
+requires = {flash = 11344, ram = 1296}
+features = ["g030"]
+stacksize = 640
+
+[tasks.jefe]
+name = "task-jefe"
+priority = 0
+max-sizes = {flash = 4096, ram = 512}
+start = true
+stacksize = 368
+notifications = ["fault", "timer"]
+
+[tasks.sys]
+name = "drv-stm32xx-sys"
+priority = 1
+max-sizes = {flash = 2048, ram = 256}
+uses = ["rcc", "gpio", "system_flash"]
+start = true
+features = ["g031", "no-ipc-counters"]
+stacksize = 256
+task-slots = ["jefe"]
+
+[tasks.pong]
+name = "task-pong"
+features = ["no-ipc-counters"]
+priority = 4
+max-sizes = {flash = 1024, ram = 256}
+start = true
+task-slots = ["user_leds"]
+stacksize = 256
+notifications = ["timer"]
+
+[tasks.user_leds]
+name = "drv-user-leds"
+features = ["stm32g0", "no-ipc-counters"]
+priority = 3
+max-sizes = {flash = 2048, ram = 256}
+start = true
+task-slots = ["sys"]
+stacksize = 256
+notifications = ["timer"]
+
+[tasks.hiffy]
+name = "task-hiffy"
+priority = 4
+max-sizes = {flash = 8192, ram = 2048}
+start = true
+task-slots = ["sys"]
+stacksize = 912
+features = ["stm32g0", "gpio", "micro", "send"]
+
+[tasks.idle]
+name = "task-idle"
+priority = 5
+max-sizes = {flash = 128, ram = 64}
+stacksize = 64
+start = true
