@@ -19,7 +19,7 @@ use lpc55_rom_data::FLASH_PAGE_SIZE as LPC55_FLASH_PAGE_SIZE;
 use multimap::MultiMap;
 use path_slash::{PathBufExt, PathExt};
 use sha3::{Digest, Sha3_256};
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 use crate::{
     caboose_pos,
@@ -42,7 +42,13 @@ pub const DEFAULT_KERNEL_STACK: u32 = 1024;
 /// that generates the Humility binary necessary for Hubris's CI has run.
 /// Once that binary is in place, you should be able to bump this version
 /// without breaking CI.
-const HUBRIS_ARCHIVE_VERSION: u32 = 9;
+///
+/// # Changelog
+/// Version 10 requires Humility to be aware of the `handoff` kernel feature,
+/// which lets the RoT inform the SP when measurements have been taken.  If
+/// Humility is unaware of this feature, the SP will reset itself repeatedly,
+/// which interferes with subsequent programming of auxiliary flash.
+const HUBRIS_ARCHIVE_VERSION: u32 = 10;
 
 /// `PackageConfig` contains a bundle of data that's commonly used when
 /// building a full app image, grouped together to avoid passing a bunch
@@ -328,6 +334,7 @@ pub fn package(
     app_toml: &Path,
     tasks_to_build: Option<Vec<String>>,
     dirty_ok: bool,
+    caboose_args: super::CabooseArgs,
 ) -> Result<BTreeMap<String, AllocationMap>> {
     let cfg = PackageConfig::new(app_toml, verbose, edges)?;
 
@@ -425,7 +432,7 @@ pub fn package(
         // Build each task.
         let mut all_output_sections = BTreeMap::default();
 
-        std::fs::create_dir_all(&cfg.img_dir(image_name))?;
+        std::fs::create_dir_all(cfg.img_dir(image_name))?;
         let (allocs, memories) = allocated
             .get(image_name)
             .ok_or_else(|| anyhow!("failed to get image name"))?;
@@ -442,6 +449,18 @@ pub fn package(
                         v.join(", ")
                     );
                 }
+            }
+        }
+        // Same check for the kernel.  This may be overly conservative, because
+        // the kernel is special, but we can always make it less strict later.
+        for r in &cfg.toml.kernel.extern_regions {
+            if let Some(v) = alloc_regions.get(r) {
+                bail!(
+                    "cannot use region '{r}' as extern region in \
+                    the kernel because it's used as a normal region by \
+                    [{}]",
+                    v.join(", ")
+                );
             }
         }
 
@@ -629,19 +648,28 @@ pub fn package(
         write_gdb_script(&cfg, image_name)?;
         let archive_name = build_archive(&cfg, image_name, raw_image)?;
 
-        // Post-build modifications: populate a default caboose if requested
-        if let Some(caboose) = &cfg.toml.caboose {
-            if caboose.default {
-                let mut archive =
-                    hubtools::RawHubrisArchive::load(&archive_name)
-                        .context("loading archive with hubtools")?;
-                // The Git hash is included in the default caboose under the key
-                // `GITC`, so we don't include it in the pseudo-version.
-                archive
-                    .write_default_caboose(None)
-                    .context("writing caboose into archive")?;
-                archive.overwrite().context("overwriting archive")?;
+        // Post-build modifications: populate the caboose if requested
+        if cfg.toml.caboose.is_some() {
+            let mut archive = hubtools::RawHubrisArchive::load(&archive_name)
+                .context("loading archive with hubtools")?;
+            if let Some(ref vers) = caboose_args.version_override {
+                println!("note: asked to override caboose `VERS` to {vers:?}");
             }
+            // The Git hash is included in the default caboose under the key
+            // `GITC`, so we don't include it in the pseudo-version.
+            archive
+                .write_default_caboose(caboose_args.version_override.as_ref())
+                .context("writing caboose into archive")?;
+            archive.overwrite().context("overwriting archive")?;
+        } else if let Some(ref vers) = caboose_args.version_override {
+            // If there's no caboose, the version override does nothing --- make
+            // sure the user realizes that.
+            eprintln!(
+                "warning: ignoring overridden caboose version \
+                 (HUBRIS_CABOOSE_VERS={vers:?}) as {} does not have a \
+                 `[caboose]` section!",
+                app_toml.display()
+            );
         }
 
         // Post-build modifications: sign the image if requested
@@ -843,9 +871,16 @@ fn build_archive(
     archive.text("app.toml", &cfg.toml.app_config)?;
 
     let chip_dir = cfg.app_src_dir.join(cfg.toml.chip.clone());
-    let chip_file = chip_dir.join("chip.toml");
-    let chip_filename = chip_file.file_name().unwrap();
-    archive.copy(&chip_file, chip_filename)?;
+
+    // Generate a synthetic `chip.toml` by serializing our peripheral map,
+    // because we may have added addition FMC peripherals.
+    archive
+        .text(
+            "chip.toml",
+            toml::to_string(&cfg.toml.peripherals)
+                .context("could not serialize chip.toml")?,
+        )
+        .context("could not write chip.toml")?;
 
     archive
         .text(
@@ -1512,11 +1547,13 @@ fn build_kernel(
     kconfig.hash(&mut image_id);
     allocs.hash(&mut image_id);
 
+    let extern_regions = cfg.toml.kernel_extern_regions(image_name)?;
     generate_kernel_linker_script(
         "memory.x",
         &allocs.kernel,
         cfg.toml.kernel.stacksize.unwrap_or(DEFAULT_KERNEL_STACK),
         &cfg.toml.all_regions("flash".to_string())?,
+        &extern_regions,
         image_name,
     )?;
 
@@ -1795,7 +1832,6 @@ fn generate_task_linker_script(
 
 fn append_image_names(
     linkscr: &mut std::fs::File,
-
     images: &IndexMap<String, Range<u32>>,
     image_name: &str,
 ) -> Result<()> {
@@ -1865,6 +1901,7 @@ fn generate_kernel_linker_script(
     map: &BTreeMap<String, Range<u32>>,
     stacksize: u32,
     images: &IndexMap<String, Range<u32>>,
+    extern_regions: &IndexMap<String, Range<u32>>,
     image_name: &str,
 ) -> Result<()> {
     // Put the linker script somewhere the linker can find it
@@ -1931,6 +1968,7 @@ fn generate_kernel_linker_script(
     .unwrap();
 
     append_image_names(&mut linkscr, images, image_name)?;
+    append_extern_regions(&mut linkscr, extern_regions)?;
     Ok(())
 }
 
@@ -1968,7 +2006,7 @@ fn build(
         });
     cmd.env(
         "RUSTFLAGS",
-        &format!(
+        format!(
             "-C link-arg=-z -C link-arg=common-page-size=0x20 \
              -C link-arg=-z -C link-arg=max-page-size=0x20 \
              -C llvm-args=--enable-machine-outliner=never \
@@ -2842,6 +2880,11 @@ pub fn make_kconfig(
     flat_shared.retain(|name, _v| used_shared_regions.contains(name.as_str()));
 
     Ok(build_kconfig::KernelConfig {
+        features: toml.kernel.features.clone(),
+        extern_regions: toml
+            .kernel_extern_regions(image_name)?
+            .into_iter()
+            .collect(),
         irqs,
         tasks,
         shared_regions: flat_shared,

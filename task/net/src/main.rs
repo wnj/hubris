@@ -46,6 +46,8 @@ mod server;
 )]
 #[cfg_attr(target_board = "medusa-a", path = "bsp/medusa_a.rs")]
 #[cfg_attr(target_board = "grapefruit", path = "bsp/grapefruit.rs")]
+#[cfg_attr(target_board = "minibar", path = "bsp/minibar.rs")]
+#[cfg_attr(target_board = "cosmo-a", path = "bsp/cosmo_a.rs")]
 mod bsp;
 
 #[cfg_attr(feature = "vlan", path = "server_vlan.rs")]
@@ -67,7 +69,7 @@ mod idl {
 use enum_map::Enum;
 use multitimer::{Multitimer, Repeat};
 use task_net_api::MacAddressBlock;
-use zerocopy::{AsBytes, U16};
+use zerocopy::{IntoBytes, U16};
 
 #[cfg(feature = "h743")]
 use stm32h7::stm32h743 as device;

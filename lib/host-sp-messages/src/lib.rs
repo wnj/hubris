@@ -13,7 +13,7 @@ use serde_big_array::BigArray;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use static_assertions::{const_assert, const_assert_eq};
 use unwrap_lite::UnwrapLite;
-use zerocopy::{AsBytes, FromBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub use hubpack::error::Error as HubpackError;
 
@@ -295,6 +295,7 @@ impl From<drv_i2c_types::ResponseCode> for InventoryDataResult {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, SerializedSize,
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum InventoryData {
     /// Raw DIMM data
     DimmSpd {
@@ -459,6 +460,65 @@ pub enum InventoryData {
 
     /// MAX31790 fan controller
     Max31790 { speed_sensors: [SensorIndex; 6] },
+
+    Raa229620a {
+        /// MFR_ID (PMBus operation 0x99)
+        mfr_id: [u8; 4],
+        /// MFR_MODEL (PMBus operation 0x9A)
+        mfr_model: [u8; 4],
+        /// MFR_REVISION (PMBus operation 0x9B)
+        mfr_revision: [u8; 4],
+        /// MFR_DATE, PMBus operation 0x9D
+        mfr_date: [u8; 4],
+        /// IC_DEVICE_ID, PMBus operation 0xAD
+        ic_device_id: [u8; 4],
+        /// IC_DEVICE_REV, PMBus operation 0xAE
+        ic_device_rev: [u8; 4],
+
+        temp_sensors: [SensorIndex; 2],
+        power_sensors: [SensorIndex; 2],
+        voltage_sensors: [SensorIndex; 2],
+        current_sensors: [SensorIndex; 2],
+    },
+
+    /// LTC4282 hot-swap controller
+    Ltc4282 {
+        voltage_sensor: SensorIndex,
+        current_sensor: SensorIndex,
+    },
+
+    /// LM5066I hot-swap controller
+    Lm5066I {
+        /// MFR_ID (PMBus operation 0x99)
+        mfr_id: [u8; 3],
+        /// MFR_MODEL (PMBus operation 0x9A)
+        mfr_model: [u8; 8],
+        /// MFR_REVISION (PMBus operation 0x9B)
+        mfr_revision: [u8; 2],
+
+        temp_sensor: SensorIndex,
+        power_sensor: SensorIndex,
+        voltage_sensor: SensorIndex,
+        current_sensor: SensorIndex,
+    },
+    /// Raw DIMM data for a DDR5 part
+    DimmDdr5Spd {
+        #[serde(with = "BigArray")]
+        id: [u8; 1024],
+        temp_sensors: [SensorIndex; 2],
+    },
+
+    /// W25Q256JVEIQ flash chip (auxiliary flash on Cosmo, Grapefruit, Sidecar)
+    W25q256jveqi { unique_id: [u8; 8] },
+
+    /// Cosmo host flash
+    W25q01jvzeiq {
+        /// 64-bit unique ID for die 0
+        die0_unique_id: [u8; 8],
+
+        /// 64-bit unique ID for die 1
+        die1_unique_id: [u8; 8],
+    },
 }
 
 #[derive(
@@ -572,7 +632,9 @@ impl From<HubpackError> for DecodeFailureReason {
     Deserialize,
     SerializedSize,
     FromBytes,
-    AsBytes,
+    Immutable,
+    KnownLayout,
+    IntoBytes,
 )]
 #[repr(transparent)]
 pub struct Status(u64);
@@ -587,7 +649,9 @@ pub struct Status(u64);
     Deserialize,
     SerializedSize,
     FromBytes,
-    AsBytes,
+    Immutable,
+    KnownLayout,
+    IntoBytes,
 )]
 #[repr(transparent)]
 pub struct HostStartupOptions(u64);
@@ -1226,7 +1290,7 @@ mod tests {
             sequence: 456,
         };
         let host_to_sp = HostToSp::HostPanic;
-        let data_blob = (0_u32..)
+        let data_blob = (0..)
             .into_iter()
             .map(|x| x as u8)
             .take(MAX_MESSAGE_SIZE)

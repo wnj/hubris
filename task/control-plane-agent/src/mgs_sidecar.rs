@@ -20,9 +20,10 @@ use gateway_messages::{
     EcdsaSha2Nistp256Challenge, IgnitionCommand, IgnitionState, MgsError,
     MgsRequest, MgsResponse, MonorailComponentAction,
     MonorailComponentActionResponse, MonorailError as GwMonorailError,
-    PowerState, RotBootInfo, RotRequest, RotResponse, SensorRequest,
-    SensorResponse, SpComponent, SpError, SpStateV2, SpUpdatePrepare,
-    UnlockChallenge, UnlockResponse, UpdateChunk, UpdateId, UpdateStatus,
+    PowerState, PowerStateTransition, RotBootInfo, RotRequest, RotResponse,
+    SensorRequest, SensorResponse, SpComponent, SpError, SpStateV2,
+    SpUpdatePrepare, UnlockChallenge, UnlockResponse, UpdateChunk, UpdateId,
+    UpdateStatus,
 };
 use host_sp_messages::HostStartupOptions;
 use idol_runtime::{Leased, RequestError};
@@ -30,7 +31,7 @@ use ringbuf::{counted_ringbuf, ringbuf_entry, ringbuf_entry_root};
 use task_control_plane_agent_api::{ControlPlaneAgentError, VpdIdentity};
 use task_net_api::{MacAddress, UdpMetadata, VLanId};
 use userlib::sys_get_timer;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 // We're included under a special `path` cfg from main.rs, which confuses rustc
 // about where our submodules live. Pass explicit paths to correct it.
@@ -800,7 +801,7 @@ impl SpHandler for MgsHandler {
         &mut self,
         sender: Sender<VLanId>,
         power_state: PowerState,
-    ) -> Result<(), SpError> {
+    ) -> Result<PowerStateTransition, SpError> {
         ringbuf_entry_root!(
             CRITICAL,
             CriticalEvent::SetPowerState {
@@ -832,7 +833,11 @@ impl SpHandler for MgsHandler {
 
         self.sequencer
             .set_tofino_seq_policy(policy)
-            .map_err(|e| SpError::PowerStateError(e as u32))
+            .map_err(|e| SpError::PowerStateError(e as u32))?;
+
+        // TODO(eliza): this should probably also be made idempotent, à la the
+        // compute sled sequencer...
+        Ok(PowerStateTransition::Changed)
     }
 
     fn serial_console_attach(
@@ -1069,7 +1074,15 @@ impl SpHandler for MgsHandler {
         &mut self,
         component: SpComponent,
     ) -> Result<(), SpError> {
-        self.common.reset_component_trigger(component)
+        match component {
+            SpComponent::MONORAIL => {
+                self.common.reset_component_trigger_check(component)?;
+                self.monorail
+                    .reinit()
+                    .map_err(|e| SpError::ComponentOperationFailed(e as u32))
+            }
+            _ => self.common.reset_component_trigger(component),
+        }
     }
 
     fn read_sensor(
@@ -1147,6 +1160,33 @@ impl SpHandler for MgsHandler {
         buf: &mut [u8],
     ) -> Result<Option<DumpSegment>, SpError> {
         self.common.task_dump_read_continue(key, seq, buf)
+    }
+
+    fn read_host_flash(
+        &mut self,
+        _slot: u16,
+        _addr: u32,
+        _buf: &mut [u8],
+    ) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::ReadHostFlash {
+            addr: 0
+        }));
+
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn start_host_flash_hash(&mut self, _slot: u16) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::StartHostFlashHash {
+            slot: 0
+        }));
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn get_host_flash_hash(&mut self, _slot: u16) -> Result<[u8; 32], SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetHostFlashHash {
+            slot: 0
+        }));
+        Err(SpError::RequestUnsupportedForSp)
     }
 }
 

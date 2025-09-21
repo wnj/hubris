@@ -67,9 +67,9 @@ impl From<Error> for ResponseCode {
 
 #[derive(Copy, Clone)]
 #[allow(dead_code)]
-struct Coefficients {
-    current: pmbus::Coefficients,
-    power: pmbus::Coefficients,
+pub(crate) struct Coefficients {
+    pub current: pmbus::Coefficients,
+    pub power: pmbus::Coefficients,
 }
 
 #[derive(Copy, Clone)]
@@ -100,11 +100,11 @@ impl core::fmt::Display for Lm5066 {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-enum Trace {
+pub enum Trace {
+    None,
     CurrentCoefficients(pmbus::Coefficients),
     PowerCoefficients(pmbus::Coefficients),
     DeviceSetup(lm5066::DEVICE_SETUP::CommandData),
-    None,
 }
 
 ringbuf!(Trace, 8, Trace::None);
@@ -136,6 +136,10 @@ impl Lm5066 {
         self.device_setup.set(Some(device_setup));
 
         Ok(device_setup)
+    }
+
+    pub fn clear_faults(&self) -> Result<(), Error> {
+        pmbus_write!(self.device, CLEAR_FAULTS)
     }
 
     ///

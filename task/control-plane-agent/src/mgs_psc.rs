@@ -14,9 +14,9 @@ use gateway_messages::{
     ignition, ComponentAction, ComponentActionResponse, ComponentDetails,
     ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask,
     IgnitionCommand, IgnitionState, MgsError, MgsRequest, MgsResponse,
-    PowerState, RotBootInfo, RotRequest, RotResponse, SensorRequest,
-    SensorResponse, SpComponent, SpError, SpStateV2, SpUpdatePrepare,
-    UpdateChunk, UpdateId, UpdateStatus,
+    PowerState, PowerStateTransition, RotBootInfo, RotRequest, RotResponse,
+    SensorRequest, SensorResponse, SpComponent, SpError, SpStateV2,
+    SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
 };
 use host_sp_messages::HostStartupOptions;
 use idol_runtime::{Leased, RequestError};
@@ -359,7 +359,7 @@ impl SpHandler for MgsHandler {
         &mut self,
         sender: Sender<VLanId>,
         power_state: PowerState,
-    ) -> Result<(), SpError> {
+    ) -> Result<PowerStateTransition, SpError> {
         ringbuf_entry_root!(
             CRITICAL,
             CriticalEvent::SetPowerState {
@@ -650,5 +650,32 @@ impl SpHandler for MgsHandler {
         buf: &mut [u8],
     ) -> Result<Option<DumpSegment>, SpError> {
         self.common.task_dump_read_continue(key, seq, buf)
+    }
+
+    fn read_host_flash(
+        &mut self,
+        _slot: u16,
+        _addr: u32,
+        _buf: &mut [u8],
+    ) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::ReadHostFlash {
+            addr: 0
+        }));
+
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn start_host_flash_hash(&mut self, _slot: u16) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::StartHostFlashHash {
+            slot: 0
+        }));
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn get_host_flash_hash(&mut self, _slot: u16) -> Result<[u8; 32], SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetHostFlashHash {
+            slot: 0
+        }));
+        Err(SpError::RequestUnsupportedForSp)
     }
 }

@@ -27,6 +27,7 @@ task_slot!(SYS, sys);
 
 #[derive(Copy, Clone, PartialEq)]
 enum Trace {
+    None,
     Execute((usize, Op)),
     Failure(Failure),
     #[cfg(feature = "gpio")]
@@ -42,7 +43,6 @@ enum Trace {
     #[cfg(feature = "gpio")]
     GpioInput(drv_stm32xx_sys_api::Port),
     Success,
-    None,
 }
 
 ringbuf!(Trace, 64, Trace::None);
@@ -583,7 +583,7 @@ pub(crate) static HIFFY_FUNCS: &[Function] = &[
 // to be able to know function indices, arguments and return values.
 //
 #[no_mangle]
-#[used]
+#[used(compiler)]
 static HIFFY_FUNCTIONS: Option<&Functions> = None;
 
 pub(crate) fn trace_execute(offset: usize, op: hif::Op) {

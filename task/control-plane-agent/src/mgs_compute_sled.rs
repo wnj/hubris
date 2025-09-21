@@ -18,10 +18,10 @@ use gateway_messages::{
     ignition, ComponentAction, ComponentActionResponse, ComponentDetails,
     ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask, Header,
     IgnitionCommand, IgnitionState, Message, MessageKind, MgsError, MgsRequest,
-    MgsResponse, PowerState, RotBootInfo, RotRequest, RotResponse,
-    SensorRequest, SensorResponse, SpComponent, SpError, SpPort as GwSpPort,
-    SpRequest, SpStateV2, SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
-    SERIAL_CONSOLE_IDLE_TIMEOUT,
+    MgsResponse, PowerState, PowerStateTransition, RotBootInfo, RotRequest,
+    RotResponse, SensorRequest, SensorResponse, SpComponent, SpError,
+    SpPort as GwSpPort, SpRequest, SpStateV2, SpUpdatePrepare, UpdateChunk,
+    UpdateId, UpdateStatus, SERIAL_CONSOLE_IDLE_TIMEOUT,
 };
 use heapless::{Deque, Vec};
 use host_sp_messages::HostStartupOptions;
@@ -446,7 +446,6 @@ impl MgsHandler {
         // what would we map it to? Maybe easier to leave it exposed.
         let state = match self.sequencer.get_state() {
             DrvPowerState::A2 | DrvPowerState::A2PlusFans => PowerState::A2,
-            DrvPowerState::A1 => PowerState::A1,
             DrvPowerState::A0
             | DrvPowerState::A0PlusHP
             | DrvPowerState::A0Thermtrip
@@ -707,8 +706,10 @@ impl SpHandler for MgsHandler {
         &mut self,
         sender: Sender<VLanId>,
         power_state: PowerState,
-    ) -> Result<(), SpError> {
+    ) -> Result<PowerStateTransition, SpError> {
         use drv_cpu_seq_api::PowerState as DrvPowerState;
+        use drv_cpu_seq_api::Transition;
+
         ringbuf_entry_root!(
             CRITICAL,
             CriticalEvent::SetPowerState {
@@ -723,16 +724,27 @@ impl SpHandler for MgsHandler {
 
         let power_state = match power_state {
             PowerState::A0 => DrvPowerState::A0,
-            PowerState::A1 => DrvPowerState::A1,
+            // Nothing should every try to go into A1
+            PowerState::A1 => {
+                return Err(SpError::PowerStateError(
+                    drv_cpu_seq_api::SeqError::IllegalTransition.into(),
+                ))
+            }
             PowerState::A2 => DrvPowerState::A2,
         };
 
-        self.sequencer
+        let transition = self
+            .sequencer
             .set_state_with_reason(
                 power_state,
                 drv_cpu_seq_api::StateChangeReason::ControlPlane,
             )
-            .map_err(|e| SpError::PowerStateError(e as u32))
+            .map_err(|e| SpError::PowerStateError(e as u32))?;
+
+        Ok(match transition {
+            Transition::Changed => PowerStateTransition::Changed,
+            Transition::Unchanged => PowerStateTransition::Unchanged,
+        })
     }
 
     fn serial_console_attach(
@@ -1141,6 +1153,32 @@ impl SpHandler for MgsHandler {
         buf: &mut [u8],
     ) -> Result<Option<DumpSegment>, SpError> {
         self.common.task_dump_read_continue(key, seq, buf)
+    }
+
+    fn read_host_flash(
+        &mut self,
+        slot: u16,
+        addr: u32,
+        buf: &mut [u8],
+    ) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::ReadHostFlash {
+            addr
+        }));
+        self.host_flash_update.read_page(slot, addr, buf)
+    }
+
+    fn start_host_flash_hash(&mut self, slot: u16) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::StartHostFlashHash {
+            slot
+        }));
+        self.host_flash_update.start_hash(slot)
+    }
+
+    fn get_host_flash_hash(&mut self, slot: u16) -> Result<[u8; 32], SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetHostFlashHash {
+            slot
+        }));
+        self.host_flash_update.get_hash(slot)
     }
 }
 

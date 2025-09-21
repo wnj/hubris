@@ -432,7 +432,7 @@ fn print_task_stacks(toml: &Config) -> Result<()> {
         let task_stack_size =
             task.stacksize.unwrap_or_else(|| toml.stacksize.unwrap());
 
-        let max_stack = get_max_stack(&toml, task_name, false)?;
+        let max_stack = get_max_stack(toml, task_name, false)?;
         let total: u64 = max_stack.iter().map(|(n, _)| *n).sum();
         println!("{task_name}: {total} bytes (limit is {task_stack_size})");
         for (frame_size, name) in max_stack {
@@ -515,7 +515,7 @@ pub fn load_task_size<'a>(
     Ok(memory_sizes)
 }
 
-fn create_sizes(toml: &Config) -> Result<TaskSizes> {
+fn create_sizes(toml: &Config) -> Result<TaskSizes<'_>> {
     let mut sizes = IndexMap::new();
 
     let kernel_sizes = load_task_size(

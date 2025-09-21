@@ -17,7 +17,7 @@
 use core::num::NonZeroUsize;
 
 use abi::{Kipcnum, TaskId};
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 use crate::{sys_send, UnwrapLite};
 
@@ -56,7 +56,7 @@ pub fn find_faulted_task(task: usize) -> Option<NonZeroUsize> {
         TaskId::KERNEL,
         Kipcnum::FindFaultedTask as u16,
         task.as_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     NonZeroUsize::new(response as usize)
@@ -100,14 +100,14 @@ pub fn read_task_dump_region(
     len
 }
 
-pub fn restart_task(task: usize, start: bool) {
+pub fn reinit_task(task: usize, start: bool) {
     // Coerce `task` to a known size (Rust doesn't assume that usize == u32)
     let msg = (task as u32, start);
     let mut buf = [0; core::mem::size_of::<(u32, bool)>()];
     ssmarshal::serialize(&mut buf, &msg).unwrap_lite();
     let (_rc, _len) = sys_send(
         TaskId::KERNEL,
-        Kipcnum::RestartTask as u16,
+        Kipcnum::ReinitTask as u16,
         &buf,
         &mut [],
         &[],

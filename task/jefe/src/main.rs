@@ -54,6 +54,14 @@ pub enum Disposition {
 // notification, but can otherwise be arbitrary.
 const TIMER_INTERVAL: u32 = 100;
 
+/// Minimum amount of time a task must run before being restarted
+///
+/// If a task runs for *less* than this amount of time before crashing, its
+/// restart is delayed to hit this value.  This value is in system ticks, which
+/// is the same as milliseconds; the current value of `50` limits a task to
+/// restarting at 20 Hz.
+const MIN_RUN_TIME: u64 = 50;
+
 #[export_name = "main"]
 fn main() -> ! {
     let mut task_states = [TaskStatus::default(); hubris_num_tasks::NUM_TASKS];
@@ -70,6 +78,7 @@ fn main() -> ! {
         state: 0,
         deadline,
         task_states: &mut task_states,
+        any_tasks_in_timeout: false,
         reset_reason: ResetReason::Unknown,
 
         #[cfg(feature = "dump")]
@@ -89,6 +98,7 @@ struct ServerImpl<'s> {
     state: u32,
     task_states: &'s mut [TaskStatus; NUM_TASKS],
     deadline: u64,
+    any_tasks_in_timeout: bool,
     reset_reason: ResetReason,
 
     /// Base address for a linked list of dump areas
@@ -158,7 +168,7 @@ impl idl::InOrderJefeImpl for ServerImpl<'_> {
         &mut self,
         msg: &userlib::RecvMessage,
     ) -> Result<(), RequestError<Infallible>> {
-        kipc::restart_task(msg.sender.index(), true);
+        kipc::reinit_task(msg.sender.index(), true);
 
         // Note: the returned value here won't go anywhere because we just
         // unblocked the caller. So this is doing a small amount of unnecessary
@@ -177,14 +187,11 @@ impl idl::InOrderJefeImpl for ServerImpl<'_> {
                 // If we have cached a dump area, then use it to accelerate
                 // lookup by jumping partway through the linked list
                 let d = if let Some(prev) = self.last_dump_area {
-                    if index == prev.index {
-                        // Easy case: we've already looked up this area
-                        Ok(prev)
-                    } else if let Some(offset) = index.checked_sub(prev.index) {
-                        // Slightly tricker: the requested area is after our
-                        // current area. We'll start at our current area, then
-                        // do a reduced number of steps (patching the index
-                        // afterwards)
+                    // We are after (or exactly at) our previously cached dump
+                    // area.  The start address should be the same, so we don't
+                    // need to walk to it, but we'll reload from from memory in
+                    // case other data in the header has changed.
+                    if let Some(offset) = index.checked_sub(prev.index) {
                         let mut d =
                             dump::get_dump_area(prev.region.address, offset);
                         if let Ok(d) = &mut d {
@@ -318,7 +325,25 @@ impl idl::InOrderJefeImpl for ServerImpl<'_> {
 #[derive(Copy, Clone, Debug, Default)]
 struct TaskStatus {
     disposition: Disposition,
-    holding_fault: bool,
+    state: TaskState,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum TaskState {
+    Running {
+        /// Time at which the task started
+        started_at: u64,
+    },
+    HoldFault,
+    Timeout {
+        restart_at: u64,
+    },
+}
+
+impl Default for TaskState {
+    fn default() -> Self {
+        TaskState::Running { started_at: 0 }
+    }
 }
 
 impl idol_runtime::NotificationHandler for ServerImpl<'_> {
@@ -326,21 +351,42 @@ impl idol_runtime::NotificationHandler for ServerImpl<'_> {
         notifications::FAULT_MASK | notifications::TIMER_MASK
     }
 
-    fn handle_notification(&mut self, bits: u32) {
-        // Handle any external (debugger) requests.
-        external::check(self.task_states);
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        let now = userlib::sys_get_timer().now;
 
-        if bits & notifications::TIMER_MASK != 0 {
-            // If our timer went off, we need to reestablish it
-            if userlib::sys_get_timer().now >= self.deadline {
-                self.deadline = userlib::set_timer_relative(
-                    TIMER_INTERVAL,
-                    notifications::TIMER_MASK,
-                );
+        // Handle any external (debugger) requests.
+        external::check(self.task_states, now);
+
+        if bits.has_timer_fired(notifications::TIMER_MASK) {
+            // If our timer went off, we need to reestablish it. Compute a
+            // baseline deadline, which will be adjusted _down_ below when
+            // processing tasks, if necessary.
+            if now >= self.deadline {
+                self.deadline = now.wrapping_add(u64::from(TIMER_INTERVAL));
+            }
+
+            // Check for tasks in timeout, updating our timer deadline
+            if core::mem::take(&mut self.any_tasks_in_timeout) {
+                for (index, status) in self.task_states.iter_mut().enumerate() {
+                    if let TaskState::Timeout { restart_at } = &status.state {
+                        if *restart_at <= now {
+                            // This deadline has elapsed, go ahead and stand it
+                            // back up.
+                            kipc::reinit_task(index, true);
+                            status.state =
+                                TaskState::Running { started_at: now };
+                        } else {
+                            // This deadline remains in the future, min it into
+                            // our next wake time.
+                            self.any_tasks_in_timeout = true;
+                            self.deadline = self.deadline.min(*restart_at);
+                        }
+                    }
+                }
             }
         }
 
-        if bits & notifications::FAULT_MASK != 0 {
+        if bits.check_notification_mask(notifications::FAULT_MASK) {
             // Work out who faulted. It's theoretically possible for more than
             // one task to have faulted since we last looked, but it's somewhat
             // unlikely since a fault causes us to immediately preempt. In any
@@ -362,11 +408,11 @@ impl idol_runtime::NotificationHandler for ServerImpl<'_> {
                 let status =
                     unsafe { self.task_states.get_unchecked_mut(fault_index) };
 
-                // If we're aware that this task is in a fault state, don't
-                // bother making a syscall to enquire.
-                if status.holding_fault {
+                // If we're aware that this task is in a fault state (or waiting
+                // in timeout), don't bother making a syscall to enquire.
+                let TaskState::Running { started_at } = &status.state else {
                     continue;
-                }
+                };
 
                 #[cfg(feature = "dump")]
                 {
@@ -379,15 +425,27 @@ impl idol_runtime::NotificationHandler for ServerImpl<'_> {
                 }
 
                 if status.disposition == Disposition::Restart {
-                    // Stand it back up
-                    kipc::restart_task(fault_index, true);
+                    let dt = now.wrapping_sub(*started_at).wrapping_add(1);
+                    if let Some(extra_delay) = MIN_RUN_TIME.checked_sub(dt) {
+                        // Put it into timeout to hit our minimum run time
+                        let restart_at = now.wrapping_add(extra_delay);
+                        status.state = TaskState::Timeout { restart_at };
+                        self.deadline = self.deadline.min(restart_at);
+                        self.any_tasks_in_timeout = true;
+                    } else {
+                        // Stand it back up immediately
+                        kipc::reinit_task(fault_index, true);
+                        status.state = TaskState::Running { started_at: now };
+                    }
                 } else {
                     // Mark this one off so we don't revisit it until
                     // requested.
-                    status.holding_fault = true;
+                    status.state = TaskState::HoldFault;
                 }
             }
         }
+
+        userlib::sys_set_timer(Some(self.deadline), notifications::TIMER_MASK);
     }
 }
 

@@ -31,13 +31,13 @@ use userlib::{
     LeaseAttributes, ReplyFaultReason, SchedState, TaskId, TaskState,
     UsageError,
 };
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 #[derive(Copy, Clone, PartialEq)]
 enum Trace {
+    None,
     TestStart,
     TestFinish,
-    None,
 }
 
 ringbuf!(Trace, 64, Trace::None);
@@ -106,6 +106,7 @@ test_cases! {
     test_panic,
     test_restart,
     test_restart_taskgen,
+    test_panic_taskgen,
     test_borrow_info,
     test_borrow_read,
     test_borrow_write,
@@ -146,7 +147,7 @@ fn test_send() {
         assist,
         AssistOp::JustReply as u16,
         &challenge.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -165,7 +166,7 @@ fn test_recv_reply() {
         assist,
         AssistOp::SendBack as u16,
         &challenge.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -173,7 +174,7 @@ fn test_recv_reply() {
     // Don't actually care about the response in this case
 
     // Switch roles and wait for the message, blocking notifications.
-    let rm = userlib::sys_recv_open(response.as_bytes_mut(), 0);
+    let rm = userlib::sys_recv_open(response.as_mut_bytes(), 0);
     assert_eq!(rm.sender, assist);
     assert_eq!(rm.operation, 42); // assistant always sends this
 
@@ -194,7 +195,7 @@ fn test_recv_reply() {
         assist,
         AssistOp::LastReply as u16,
         &challenge.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -213,14 +214,14 @@ fn test_recv_reply_fault() {
         assist,
         AssistOp::SendBack as u16,
         &challenge.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
     assert_eq!(len, 4);
 
     // Now take the message. This is necessary to be able to fault the task.
-    let _rm = userlib::sys_recv_open(response.as_bytes_mut(), 0);
+    let _rm = userlib::sys_recv_open(response.as_mut_bytes(), 0);
 
     // We don't validate the message itself because the test_recv_reply above
     // covers that. We're specifically interested in what happens if we...
@@ -258,7 +259,7 @@ fn test_fault(op: AssistOp, arg: u32) -> FaultInfo {
         assist,
         op as u16,
         &arg.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -466,7 +467,7 @@ fn test_panic() {
         assist,
         AssistOp::Panic as u16,
         &0u32.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -879,7 +880,7 @@ fn test_restart() {
         assist,
         AssistOp::Store as u16,
         &value.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -894,7 +895,7 @@ fn test_restart() {
         assist,
         AssistOp::Store as u16,
         &value2.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -911,7 +912,7 @@ fn test_restart() {
         assist,
         AssistOp::Store as u16,
         &value.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -919,6 +920,54 @@ fn test_restart() {
 
     // Confirm that the assistant lost our old value and returned to boot state.
     assert_eq!(response, 0);
+}
+
+/// Enables or disables automatic restarting of tasks in the supervisor
+///
+/// Note that the test suite (that's us) is never automatically restarted,
+/// because it panics to indicate test failures.
+fn set_autorestart(autorestart: bool) {
+    let runner = RUNNER.get_task_id();
+    let mut response = 0u32;
+    let op = RunnerOp::AutoRestart as u16;
+    let arg = u32::from(autorestart);
+    let (rc, len) = userlib::sys_send(
+        runner,
+        op,
+        arg.as_bytes(),
+        response.as_mut_bytes(),
+        &[],
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(len, 0);
+}
+
+/// Tests that when our task dies, we get an error code that consists of
+/// the new generation in the lower bits.
+fn test_panic_taskgen() {
+    set_autorestart(true);
+
+    // Ask the assistant to panic.
+    let assist = assist_task_id();
+    let initial_gen = assist.generation();
+    let mut response = 0u32;
+    let (rc, len) = userlib::sys_send(
+        assist,
+        AssistOp::FastPanic as u16,
+        &0u32.to_le_bytes(),
+        response.as_mut_bytes(),
+        &[],
+    );
+
+    // Clean up by disabling auto-restart before making our assertions
+    set_autorestart(false);
+
+    // The returned value should be a dead code indicating the new generation
+    assert_eq!(rc & 0xffff_ff00, 0xffff_ff00);
+    assert_eq!(len, 0);
+    let new_gen = Generation::from((rc & 0xff) as u8);
+    assert_ne!(initial_gen, new_gen);
+    assert_eq!(assist_task_id().generation(), new_gen);
 }
 
 /// Tests that when our task dies, we get an error code that consists of
@@ -932,7 +981,7 @@ fn test_restart_taskgen() {
         assist,
         AssistOp::Panic as u16,
         &0u32.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -957,7 +1006,7 @@ fn test_restart_taskgen() {
         assist,
         AssistOp::SendBack as u16,
         &payload.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
 
@@ -983,7 +1032,7 @@ fn test_borrow_info() {
         assist,
         AssistOp::SendBackWithLoans as u16,
         &0u32.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -992,7 +1041,7 @@ fn test_borrow_info() {
 
     // Receive...
     hl::recv_without_notification(
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         |_op: u32, msg| -> Result<(), u32> {
             let (_msg, caller) = msg.fixed::<u32, u32>().unwrap();
 
@@ -1026,7 +1075,7 @@ fn test_borrow_read() {
         assist,
         AssistOp::SendBackWithLoans as u16,
         &0u32.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -1035,7 +1084,7 @@ fn test_borrow_read() {
 
     // Receive:
     hl::recv_without_notification(
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         |_op: u32, msg| -> Result<(), u32> {
             let (_msg, caller) = msg.fixed::<u32, u32>().unwrap();
 
@@ -1067,7 +1116,7 @@ fn test_borrow_write() {
         assist,
         AssistOp::SendBackWithLoans as u16,
         &0u32.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -1075,7 +1124,7 @@ fn test_borrow_write() {
     // Don't actually care about the response in this case
 
     hl::recv_without_notification(
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         |_op: u32, msg| -> Result<(), u32> {
             let (_msg, caller) = msg.fixed::<u32, u32>().unwrap();
 
@@ -1144,7 +1193,7 @@ fn test_supervisor_fault_notification() {
             assist,
             AssistOp::Panic as u16,
             &0u32.to_le_bytes(),
-            response.as_bytes_mut(),
+            response.as_mut_bytes(),
             &[],
         );
         assert_eq!(rc, 0);
@@ -1259,7 +1308,7 @@ fn test_floating_point(highregs: bool) {
         assist,
         AssistOp::EatSomePi as u16,
         &which.to_le_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -1310,7 +1359,7 @@ fn test_task_status() {
             assist,
             AssistOp::ReadTaskStatus as u16,
             &id.to_le_bytes(),
-            response.as_bytes_mut(),
+            response.as_mut_bytes(),
             &[],
         );
         assert_eq!(rc, 0);
@@ -1404,7 +1453,7 @@ fn test_post() {
         assist,
         AssistOp::ReadNotifications as u16,
         unused.as_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -1421,7 +1470,7 @@ fn test_post() {
         assist,
         AssistOp::ReadNotifications as u16,
         unused.as_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -1516,7 +1565,7 @@ fn trigger_test_irq() {
         runner,
         op,
         arg.as_bytes(),
-        response.as_bytes_mut(),
+        response.as_mut_bytes(),
         &[],
     );
     assert_eq!(rc, 0);
@@ -1546,7 +1595,7 @@ fn idol_handle() -> test_idol_api::IdolTest {
 
 /// Restarts the assistant task.
 fn restart_assistant() {
-    kipc::restart_task(ASSIST.get_task_index().into(), true);
+    kipc::reinit_task(ASSIST.get_task_index().into(), true);
 }
 
 /// Contacts the runner task to read (and clear) its accumulated set of
@@ -1556,7 +1605,7 @@ fn read_runner_notifications() -> u32 {
     let mut response = 0u32;
     let op = RunnerOp::ReadAndClearNotes as u16;
     let (rc, len) =
-        userlib::sys_send(runner, op, &[], response.as_bytes_mut(), &[]);
+        userlib::sys_send(runner, op, &[], response.as_mut_bytes(), &[]);
     assert_eq!(rc, 0);
     assert_eq!(len, 4);
     response
@@ -1568,7 +1617,7 @@ fn main() -> ! {
     // Work out the assistant generation. Restart it to ensure it's running
     // before we try talking to it. TODO: this is kind of gross, we need a way
     // to just ask.
-    kipc::restart_task(ASSIST.get_task_index().into(), true);
+    kipc::reinit_task(ASSIST.get_task_index().into(), true);
     loop {
         let assist = assist_task_id();
         let challenge = 0xDEADBEEF_u32;
@@ -1577,7 +1626,7 @@ fn main() -> ! {
             assist,
             0,
             &challenge.to_le_bytes(),
-            response.as_bytes_mut(),
+            response.as_mut_bytes(),
             &[],
         );
         if rc == 0 {

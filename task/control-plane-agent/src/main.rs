@@ -170,6 +170,15 @@ enum MgsMessage {
     VersionedRotBootInfo {
         version: u8,
     },
+    ReadHostFlash {
+        addr: u32,
+    },
+    StartHostFlashHash {
+        slot: u16,
+    },
+    GetHostFlashHash {
+        slot: u16,
+    },
 }
 
 // This enum does not define the actual IPC protocol - it is only used in the
@@ -252,16 +261,16 @@ impl NotificationHandler for ServerImpl {
             | notifications::TIMER_MASK
     }
 
-    fn handle_notification(&mut self, bits: u32) {
-        if (bits & notifications::USART_IRQ_MASK) != 0 {
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.check_notification_mask(notifications::USART_IRQ_MASK) {
             self.mgs_handler.drive_usart();
         }
 
-        if (bits & notifications::TIMER_MASK) != 0 {
+        if bits.has_timer_fired(notifications::TIMER_MASK) {
             self.mgs_handler.handle_timer_fired();
         }
 
-        if (bits & notifications::SOCKET_MASK) != 0
+        if bits.check_notification_mask(notifications::SOCKET_MASK)
             || self.net_handler.packet_to_send.is_some()
             || self.mgs_handler.wants_to_send_packet_to_mgs()
         {

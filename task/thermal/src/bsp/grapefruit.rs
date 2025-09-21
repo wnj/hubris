@@ -50,9 +50,13 @@ pub enum SeqError {}
 
 #[allow(dead_code)]
 pub(crate) struct Bsp {
-    pub inputs: &'static [InputChannel],
-    pub dynamic_inputs: &'static [SensorId],
-    pub misc_sensors: &'static [TemperatureSensor],
+    /// Controlled sensors
+    pub inputs: &'static [InputChannel; NUM_TEMPERATURE_INPUTS],
+    pub dynamic_inputs: &'static [SensorId; NUM_DYNAMIC_TEMPERATURE_INPUTS],
+
+    /// Monitored sensors
+    pub misc_sensors: &'static [TemperatureSensor; NUM_TEMPERATURE_SENSORS],
+
     pub pid_config: PidConfig,
 
     fctrl: Emc2305State,
@@ -86,10 +90,14 @@ impl Bsp {
 
     pub fn get_fan_presence(&self) -> Result<Fans<{ NUM_FANS }>, SeqError> {
         let mut fans = Fans::new();
-        for i in 0..fans.len() {
+        for i in 0..NUM_FANS {
             fans[i] = Some(sensors::EMC2305_SPEED_SENSORS[i]);
         }
         Ok(fans)
+    }
+
+    pub fn fan_sensor_id(&self, i: usize) -> SensorId {
+        sensors::EMC2305_SPEED_SENSORS[i]
     }
 
     pub fn new(i2c_task: TaskId) -> Self {

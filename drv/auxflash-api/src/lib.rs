@@ -10,7 +10,7 @@ use derive_idol_err::IdolError;
 use sha3::{Digest, Sha3_256};
 use tlvc::{TlvcRead, TlvcReader};
 use userlib::{sys_send, FromPrimitive};
-use zerocopy::{AsBytes, FromBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub use drv_qspi_api::{PAGE_SIZE_BYTES, SECTOR_SIZE_BYTES};
 
@@ -47,24 +47,33 @@ pub enum AuxFlashError {
     NoSuchBlob,
     /// Writes to the currently-active slot are not allowed
     SlotActive,
-
+    /// QSPI Timed out
+    QspiTimeout,
+    /// QSPI Transfer error
+    QspiTransferError,
     #[idol(server_death)]
     ServerRestarted,
 }
 
-#[derive(Copy, Clone, FromBytes, AsBytes)]
-#[repr(transparent)]
-pub struct AuxFlashId(pub [u8; 20]);
+#[derive(Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct AuxFlashId {
+    pub mfr_id: u8,
+    pub memory_type: u8,
+    pub capacity: u8,
+    pub unique_id: [u8; 8],
+}
 
-#[derive(Copy, Clone, PartialEq, Eq, FromBytes, AsBytes)]
+#[derive(
+    Copy, Clone, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
 #[repr(transparent)]
 pub struct AuxFlashChecksum(pub [u8; 32]);
 
-#[derive(Copy, Clone, FromBytes, AsBytes)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(transparent)]
 pub struct AuxFlashTag(pub [u8; 4]);
 
-#[derive(Copy, Clone, FromBytes, AsBytes)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct AuxFlashBlob {
     pub slot: u32,
@@ -225,9 +234,9 @@ impl AuxFlash {
 
 include!(concat!(env!("OUT_DIR"), "/client_stub.rs"));
 
+#[allow(unused)]
 mod config {
     include!(concat!(env!("OUT_DIR"), "/auxflash_config.rs"));
 }
 
-pub use self::config::SLOT_COUNT;
-pub const SLOT_SIZE: usize = (self::config::MEMORY_SIZE / SLOT_COUNT) as usize;
+pub use config::{SLOT_COUNT, SLOT_SIZE};

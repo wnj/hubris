@@ -71,9 +71,9 @@ pub(crate) fn get_state() -> PowerState {
         | seq_api::PowerState::A0PlusHP
         | seq_api::PowerState::A0Thermtrip
         | seq_api::PowerState::A0Reset => PowerState::A0,
-        seq_api::PowerState::A1
-        | seq_api::PowerState::A2
-        | seq_api::PowerState::A2PlusFans => PowerState::A2,
+        seq_api::PowerState::A2 | seq_api::PowerState::A2PlusFans => {
+            PowerState::A2
+        }
     }
 }
 
@@ -104,6 +104,7 @@ const TRACE_DEPTH: usize = 52;
 /// Tooling can then collect this ringbuf periodically and get recent events.
 #[derive(Copy, Clone, PartialEq)]
 enum Trace {
+    None,
     /// Written before trace records; the `u32` is the number of times the task
     /// has woken up to process its timer. This is not exactly equivalent to
     /// seconds because of the way the timer is maintained, but is approximately
@@ -134,7 +135,6 @@ enum Trace {
         crossbounce_min_vout: f32,
         crossbounce_max_vout: f32,
     },
-    None,
 }
 
 ringbuf!(Trace, TRACE_DEPTH, Trace::None);
@@ -292,7 +292,7 @@ impl State {
         //
         // Trace the detailed state every ten seconds, provided that we are in A0.
         //
-        if state == PowerState::A0 && self.fired % TRACE_SECONDS == 0 {
+        if state == PowerState::A0 && self.fired.is_multiple_of(TRACE_SECONDS) {
             ringbuf_entry!(Trace::Now(self.fired));
 
             for ((dev, sensor), peak) in CONTROLLER_CONFIG

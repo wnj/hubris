@@ -14,6 +14,7 @@ use drv_i2c_devices::adm1272::*;
 use drv_i2c_devices::bmr491::*;
 use drv_i2c_devices::isl68224::*;
 use drv_i2c_devices::lm5066::*;
+use drv_i2c_devices::lm5066i::*;
 use drv_i2c_devices::ltc4282::*;
 use drv_i2c_devices::max5970::*;
 use drv_i2c_devices::mwocp68::*;
@@ -28,7 +29,7 @@ use task_power_api::{
 use task_sensor_api as sensor_api;
 use userlib::units::*;
 use userlib::*;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 use drv_i2c_api::{I2cDevice, ResponseCode};
 use drv_i2c_devices::{
@@ -38,9 +39,9 @@ use drv_i2c_devices::{
 
 #[derive(Copy, Clone, PartialEq)]
 enum Trace {
+    None,
     GotVersion(u32),
     GotAddr(u32),
-    None,
 }
 
 ringbuf!(Trace, 2, Trace::None);
@@ -85,10 +86,11 @@ enum DeviceChip {
     Isl68224,
     Tps546B24A,
     Adm1272(Ohms),
-    Max5970(Ohms),
+    Max5970 { sense: Ohms, avg: bool },
     Mwocp68,
     Ltc4282(Ohms),
     Lm5066(Ohms, CurrentLimitStrap),
+    Lm5066I(Ohms, CurrentLimitStrap),
 }
 
 struct PowerControllerConfig {
@@ -116,6 +118,7 @@ enum Device {
     Mwocp68(Mwocp68),
     Ltc4282(Ltc4282),
     Lm5066(Lm5066),
+    Lm5066I(Lm5066I),
 }
 
 impl Device {
@@ -128,6 +131,7 @@ impl Device {
             Device::Tps546B24A(dev) => dev.read_temperature()?,
             Device::Adm1272(dev) => dev.read_temperature()?,
             Device::Lm5066(dev) => dev.read_temperature()?,
+            Device::Lm5066I(dev) => dev.read_temperature()?,
             Device::Mwocp68(..) => {
                 // The MWOCP68 actually has three temperature sensors, but they
                 // aren't associated with power rails, so we don't read them
@@ -153,6 +157,7 @@ impl Device {
             Device::Mwocp68(dev) => dev.read_iout()?,
             Device::Ltc4282(dev) => dev.read_iout()?,
             Device::Lm5066(dev) => dev.read_iout()?,
+            Device::Lm5066I(dev) => dev.read_iout()?,
         };
         Ok(r)
     }
@@ -169,6 +174,7 @@ impl Device {
             Device::Mwocp68(dev) => dev.read_vout()?,
             Device::Ltc4282(dev) => dev.read_vout()?,
             Device::Lm5066(dev) => dev.read_vout()?,
+            Device::Lm5066I(dev) => dev.read_vout()?,
         };
         Ok(r)
     }
@@ -218,6 +224,7 @@ impl Device {
             | Device::Adm1272(_)
             | Device::Ltc4282(_)
             | Device::Lm5066(_)
+            | Device::Lm5066I(_)
             | Device::Max5970(_) => {
                 return Err(ResponseCode::OperationNotSupported)
             }
@@ -236,7 +243,8 @@ impl Device {
             Device::Adm1272(..)
             | Device::Ltc4282(..)
             | Device::Max5970(..)
-            | Device::Lm5066(..) => {
+            | Device::Lm5066(..)
+            | Device::Lm5066I(..) => {
                 return Err(ResponseCode::OperationNotSupported)
             }
         };
@@ -255,6 +263,7 @@ impl Device {
             Device::Ltc4282(dev) => dev.i2c_device(),
             Device::Max5970(dev) => dev.i2c_device(),
             Device::Lm5066(dev) => dev.i2c_device(),
+            Device::Lm5066I(dev) => dev.i2c_device(),
         }
     }
 }
@@ -277,8 +286,8 @@ impl PowerControllerConfig {
             DeviceChip::Adm1272(sense) => {
                 Device::Adm1272(Adm1272::new(&dev, *sense))
             }
-            DeviceChip::Max5970(sense) => {
-                Device::Max5970(Max5970::new(&dev, rail, *sense))
+            DeviceChip::Max5970 { sense, avg } => {
+                Device::Max5970(Max5970::new(&dev, rail, *sense, *avg))
             }
             DeviceChip::Mwocp68 => Device::Mwocp68(Mwocp68::new(&dev, rail)),
             DeviceChip::Ltc4282(sense) => {
@@ -286,6 +295,9 @@ impl PowerControllerConfig {
             }
             DeviceChip::Lm5066(sense, strap) => {
                 Device::Lm5066(Lm5066::new(&dev, *sense, *strap))
+            }
+            DeviceChip::Lm5066I(sense, strap) => {
+                Device::Lm5066I(Lm5066I::new(&dev, *sense, *strap))
             }
         }
     }
@@ -398,13 +410,38 @@ macro_rules! lm5066_controller {
 }
 
 #[allow(unused_macros)]
-macro_rules! max5970_controller {
-    ($which:ident, $rail:ident, $state:ident, $rsense:expr) => {
+macro_rules! lm5066i_controller {
+    ($which:ident, $rail:ident, $state:ident, $rsense:expr, $strap:expr) => {
         paste::paste! {
             PowerControllerConfig {
                 state: $crate::PowerState::$state,
                 device: $crate::DeviceType::$which,
-                chip: $crate::DeviceChip::Max5970($rsense),
+                chip: $crate::DeviceChip::Lm5066I($rsense, $strap),
+                builder: i2c_config::pmbus::$rail,
+                voltage: sensors::[<LM5066I_ $rail:upper _VOLTAGE_SENSOR>],
+                input_voltage: None,
+                current: sensors::[<LM5066I_ $rail:upper _CURRENT_SENSOR>],
+                input_current: None,
+                temperature: Some(
+                    sensors::[<LM5066I_ $rail:upper _TEMPERATURE_SENSOR>]
+                ),
+                phases: None,
+            }
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! max5970_controller {
+    ($which:ident, $rail:ident, $state:ident, $rsense:expr) => {
+        max5970_controller!($which, $rail, $state, $rsense, false)
+    };
+    ($which:ident, $rail:ident, $state:ident, $rsense:expr, $avg:expr) => {
+        paste::paste! {
+            PowerControllerConfig {
+                state: $crate::PowerState::$state,
+                device: $crate::DeviceType::$which,
+                chip: $crate::DeviceChip::Max5970 { sense: $rsense, avg: $avg },
                 builder: i2c_config::power::$rail,
                 voltage: sensors::[<MAX5970_ $rail:upper _VOLTAGE_SENSOR>],
                 input_voltage: None,
@@ -468,6 +505,8 @@ macro_rules! mwocp68_controller {
     path = "bsp/sidecar_bcd.rs"
 )]
 #[cfg_attr(target_board = "gimletlet-2", path = "bsp/gimletlet_2.rs")]
+#[cfg_attr(target_board = "minibar", path = "bsp/minibar.rs")]
+#[cfg_attr(target_board = "cosmo-a", path = "bsp/cosmo_a.rs")]
 mod bsp;
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -619,7 +658,7 @@ impl ServerImpl {
             .ok_or(ResponseCode::NoDevice)
     }
 
-    fn raw_pmbus_read<T: zerocopy::FromBytes + zerocopy::AsBytes>(
+    fn raw_pmbus_read<T: zerocopy::FromBytes + zerocopy::IntoBytes>(
         &mut self,
         index: u32,
         has_rail: bool,
@@ -641,7 +680,7 @@ impl ServerImpl {
         Ok(out)
     }
 
-    fn raw_pmbus_write<T: zerocopy::AsBytes>(
+    fn raw_pmbus_write<T: zerocopy::IntoBytes>(
         &mut self,
         index: u32,
         has_rail: bool,
@@ -653,7 +692,7 @@ impl ServerImpl {
             .ok_or(ResponseCode::NoDevice)?;
         let (dev, rail) = (cfg.builder)(self.i2c_task);
 
-        #[repr(packed)]
+        #[repr(C, packed)]
         #[allow(dead_code)]
         struct Args<T> {
             op: u8,
@@ -662,7 +701,7 @@ impl ServerImpl {
         let args = Args { op, value };
 
         // SAFETY: this is a packed struct and T is constrained to be
-        // AsBytes, so there should be no padding bytes
+        // IntoBytes, so there should be no padding bytes
         let args_slice = unsafe {
             core::slice::from_raw_parts(
                 (&args as *const Args<T>) as *const u8,
@@ -686,9 +725,14 @@ impl idol_runtime::NotificationHandler for ServerImpl {
         notifications::TIMER_MASK
     }
 
-    fn handle_notification(&mut self, _bits: u32) {
-        self.handle_timer_fired();
-        userlib::set_timer_relative(TIMER_INTERVAL, notifications::TIMER_MASK);
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.has_timer_fired(notifications::TIMER_MASK) {
+            self.handle_timer_fired();
+            userlib::set_timer_relative(
+                TIMER_INTERVAL,
+                notifications::TIMER_MASK,
+            );
+        }
     }
 }
 
@@ -1019,7 +1063,7 @@ impl idl::InOrderPowerImpl for ServerImpl {
 
         // Step 1 - Verify Part Revision
         let mut id = 0u32;
-        dev.read_block(CommandCode::IC_DEVICE_REV as u8, id.as_bytes_mut())?;
+        dev.read_block(CommandCode::IC_DEVICE_REV as u8, id.as_mut_bytes())?;
         ringbuf_entry!(Trace::GotVersion(id));
 
         // Experimentally determined ID

@@ -14,9 +14,10 @@
 #![no_main]
 
 use ringbuf::{counted_ringbuf, ringbuf_entry};
-use userlib::{hl::sleep_for, task_slot};
+use userlib::{hl::sleep_for, task_slot, UnwrapLite};
 
-mod hf; // implementation of `HostFlash` API
+mod apob; // Details for APOB structs
+mod hf; // Implementation of `HostFlash` API
 
 task_slot!(LOADER, spartan7_loader);
 
@@ -32,29 +33,16 @@ enum Trace {
     HashInitError(drv_hash_api::HashError),
     HashUpdateError(drv_hash_api::HashError),
     HashFinalizeError(drv_hash_api::HashError),
+
+    ApobFound(apob::ApobLocation),
+    ApobError(apob::ApobError),
 }
 
 counted_ringbuf!(Trace, 32, Trace::None);
 
-/// Size in bytes of a single page of data (i.e., the max length of slice we
-/// accept for `page_program()` and `read_memory()`).
-///
-/// This value is really a property of the flash we're talking to and not this
-/// driver, but it's correct for all our current parts. If that changes, this
-/// will need to change to something more flexible.
-pub const PAGE_SIZE_BYTES: usize = 256;
-
-/// Size in bytes of a single sector of data (i.e., the size of the data erased
-/// by a call to `sector_erase()`).
-///
-/// This value is really a property of the flash we're talking to and not this
-/// driver, but it's correct for all our current parts. If that changes, this
-/// will need to change to something more flexible.
-///
-/// **Note:** the datasheet refers to a "sector" as a 4K block, but also
-/// supports 64K block erases, so we call the latter a sector to match the
-/// behavior of the Gimlet host flash driver.
-pub const SECTOR_SIZE_BYTES: u32 = 65_536;
+// Re-export constants from the generic host flash API
+pub use drv_hf_api::PAGE_SIZE_BYTES;
+pub const SECTOR_SIZE_BYTES: u32 = drv_hf_api::SECTOR_SIZE_BYTES as u32;
 
 /// Total flash size is 128 MiB
 pub const FLASH_SIZE_BYTES: u32 = 128 * 1024 * 1024;
@@ -66,20 +54,22 @@ fn main() -> ! {
     let seq =
         drv_spartan7_loader_api::Spartan7Loader::from(LOADER.get_task_id());
 
-    let base = fmc_periph::Base::new(seq.get_token());
-    let id = base.id.data();
-    if id != 0x1de {
-        fail(drv_hf_api::HfError::FpgaNotConfigured);
-    }
-
-    let drv = FlashDriver {
+    let mut drv = FlashDriver {
         drv: fmc_periph::SpiNor::new(seq.get_token()),
     };
     drv.flash_set_quad_enable();
 
-    // Check the flash chip's ID against Table 7.3.1 in the datasheet
+    // Check the flash chip's ID against Table 7.3.1 in the W25Q01JV datasheet
+    // (revision B1, published November 13, 2019)
     let id = drv.flash_read_id();
-    if id[0..3] != [0xef, 0x40, 0x21] {
+    const WINBOND_MFR_ID: u8 = 0xef;
+    const EXPECTED_TYPE: u8 = 0x40;
+    const EXPECTED_CAPACITY: u8 = 0x21;
+
+    if id.mfr_id != WINBOND_MFR_ID
+        || id.memory_type != EXPECTED_TYPE
+        || id.capacity != EXPECTED_CAPACITY
+    {
         fail(drv_hf_api::HfError::BadChipId);
     }
 
@@ -91,7 +81,7 @@ fn main() -> ! {
 }
 
 /// Absolute memory address
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 struct FlashAddr(u32);
 
 impl FlashAddr {
@@ -101,9 +91,6 @@ impl FlashAddr {
         } else {
             None
         }
-    }
-    fn get(&self) -> u32 {
-        self.0
     }
 }
 
@@ -125,6 +112,7 @@ mod instr {
     pub const FAST_READ_QUAD_OUTPUT_4B: u8 = 0x6c;
     pub const SECTOR_ERASE: u8 = 0x20;
     pub const READ_JEDEC_ID: u8 = 0x9f;
+    pub const READ_UNIQUE_ID: u8 = 0x4b;
     pub const BLOCK_ERASE_64KB: u8 = 0xd8;
     pub const BLOCK_ERASE_64KB_4B: u8 = 0xdc;
     pub const QUAD_INPUT_PAGE_PROGRAM: u8 = 0x32;
@@ -132,15 +120,59 @@ mod instr {
 }
 
 impl FlashDriver {
-    fn flash_read_id(&self) -> [u8; 20] {
+    fn flash_read_id(&mut self) -> drv_hf_api::HfChipId {
         self.clear_fifos();
-        self.drv.data_bytes.set_count(20);
+        self.drv.data_bytes.set_count(3);
         self.drv.addr.set_addr(0);
         self.drv.dummy_cycles.set_count(0);
         self.drv.instr.set_opcode(instr::READ_JEDEC_ID);
         self.wait_fpga_busy();
-        let mut out = [0u8; 20];
-        for i in 0..out.len() / 4 {
+        let v = self.drv.rx_fifo_rdata.fifo_data();
+        let bytes = v.to_le_bytes();
+        let mfr_id = bytes[0];
+        let memory_type = bytes[1];
+        let capacity = bytes[2];
+
+        // Make sure die 0 is selected with a dummy read, because the
+        // READ_UNIQUE_ID command is die-specific.
+        let mut buf = [0u8; 4];
+        self.flash_read(FlashAddr(0), &mut buf.as_mut_slice())
+            .unwrap_lite(); // infallible when given a slice
+        let die0_id = self.read_unique_id();
+
+        // Then read the top die's unique ID
+        self.flash_read(FlashAddr(0x04000000), &mut buf.as_mut_slice())
+            .unwrap_lite(); // infallible when given a slice
+        let die1_id = self.read_unique_id();
+
+        let mut unique_id = [0u8; 17];
+        unique_id[0..8].copy_from_slice(&die0_id);
+        unique_id[8..16].copy_from_slice(&die1_id);
+
+        drv_hf_api::HfChipId {
+            mfr_id,
+            memory_type,
+            capacity,
+            unique_id,
+        }
+    }
+
+    /// Reads the unique id (`READ_UNIQUE_ID`, `4Bh`) from the selected die
+    ///
+    /// The selected die depends on previous commands; see "W25Q01JV SpiFlash
+    /// Stacked Die Usage" for details (available in Drive).
+    fn read_unique_id(&mut self) -> [u8; 8] {
+        // We are running with 3-byte addresses, so we need to skip 4 bytes (32
+        // clocks) of dummy data.  The datasheet indicates that the DO line is
+        // high-Z when this happens, but experimentally, it's just clocking out
+        // parts of the unique ID.  Regardless, we'll skip those bytes.
+        self.drv.data_bytes.set_count(8);
+        self.drv.addr.set_addr(0);
+        self.drv.dummy_cycles.set_count(32);
+        self.drv.instr.set_opcode(instr::READ_UNIQUE_ID);
+        self.wait_fpga_busy();
+        let mut out = [0u8; 8];
+        for i in 0..2 {
             let v = self.drv.rx_fifo_rdata.fifo_data();
             for (j, byte) in v.to_le_bytes().iter().enumerate() {
                 out[i * 4 + j] = *byte;
@@ -151,27 +183,12 @@ impl FlashDriver {
 
     /// Wait until the FPGA is idle
     fn wait_fpga_busy(&self) {
-        loop {
-            if !self.drv.spisr.busy() {
-                break;
-            }
-            ringbuf_entry!(Trace::FpgaBusy);
-            sleep_for(1);
-        }
+        self.poll_wait(|this| !this.drv.spisr.busy(), Trace::FpgaBusy)
     }
 
     /// Wait until a word is available in the FPGA's RX buffer
     fn wait_fpga_rx(&self) {
-        for i in 0.. {
-            if !self.drv.spisr.rx_empty() {
-                break;
-            }
-            ringbuf_entry!(Trace::FpgaBusy);
-            // Initial busy-loop for faster response
-            if i >= 32 {
-                sleep_for(1);
-            }
-        }
+        self.poll_wait(|this| !this.drv.spisr.rx_empty(), Trace::FpgaBusy)
     }
 
     /// Clears the FPGA's internal FIFOs
@@ -183,13 +200,48 @@ impl FlashDriver {
         });
     }
 
+    /// Wait for a condition represented by the provided `poll` function.
+    ///
+    /// The driver will wait until the `poll` function returns `true`. Each time
+    /// `poll` returns `false`, the provided `trace` will be recorded in the
+    /// ring buffer.
+    #[inline]
+    fn poll_wait(&self, mut poll: impl FnMut(&Self) -> bool, trace: Trace) {
+        // When polling the FPGA or flash chips, this number of polls are
+        // attempted *without* sleeping between polls. If the FPGA/flash's
+        // status has not changed after this number of polls, the driver will
+        // begin to sleep for a short period between subsequent polls.
+        //
+        // This is intended to improve copy performance for operations where the
+        // desired status transition occurs in less than 1ms, avoiding a 1-2ms
+        // sleep and round-trip through the scheduler. status transitions
+        // quickly.
+        const MAX_BUSY_POLLS: u32 = 32;
+
+        let mut busy_polls = 0;
+        while !poll(self) {
+            ringbuf_entry!(trace);
+
+            if busy_polls > MAX_BUSY_POLLS {
+                // If we've exhausted all of our busy polls, sleep for a bit
+                // before polling again.
+                sleep_for(1);
+            } else {
+                // Only increment the counter while we are busy-polling.
+                // Otherwise, if we incremented it unconditionally, we might
+                // overflow and start busy-polling again. Of course, we won't do
+                // that unless we are stuck waiting for 4,294,967,295ms, which
+                // is a little under 50 days, so things would probably have gone
+                // very wrong if that happened. But, still...
+                busy_polls += 1;
+            }
+        }
+    }
+
     /// Wait until the SPI flash is idle
     fn wait_flash_busy(&self, t: Trace) {
         // Wait for the busy flag to be unset
-        while (self.read_flash_status() & 1) != 0 {
-            ringbuf_entry!(t);
-            sleep_for(1);
-        }
+        self.poll_wait(|this| this.read_flash_status() & 1 == 0, t);
     }
 
     /// Reads the STATUS1 register from flash
@@ -354,14 +406,30 @@ impl FlashDriver {
     }
 
     fn set_espi_addr_offset(&self, v: FlashAddr) {
-        self.drv.sp5_flash_offset.set_offset(v.0);
+        // The SP5 does all of its reads from a particular base address (found
+        // by sniffing the SPI bus), so we have to subtract that out when
+        // calculating the flash offset used by the FPGA
+        const SP5_BASE: u32 = 0x3000000;
+        self.drv
+            .sp5_flash_offset
+            .set_offset(v.0.wrapping_sub(SP5_BASE));
+    }
+
+    pub(crate) fn set_apob_pos(&self, pos: apob::ApobLocation) {
+        self.drv.apob_flash_addr.set_offset(pos.start);
+        self.drv.apob_flash_len.set_offset(pos.size);
+    }
+
+    pub(crate) fn clear_apob_pos(&self) {
+        self.drv.apob_flash_addr.set_offset(0);
+        self.drv.apob_flash_len.set_offset(0);
     }
 }
 
 /// Failure function, running an Idol response loop that always returns an error
 fn fail(err: drv_hf_api::HfError) {
     let mut buffer = [0; hf::idl::INCOMING_SIZE];
-    let mut server = hf::FailServer { err };
+    let mut server = hf::idl::FailServer::new(err);
     loop {
         idol_runtime::dispatch(&mut buffer, &mut server);
     }

@@ -12,7 +12,9 @@ use attest_data::messages::{
     HostToRotCommand, RecvSprotError as AttestDataSprotError, RotToHost,
     MAX_DATA_LEN,
 };
-use drv_cpu_seq_api::{PowerState, SeqError, Sequencer, StateChangeReason};
+use drv_cpu_seq_api::{
+    PowerState, SeqError, Sequencer, StateChangeReason, Transition,
+};
 use drv_hf_api::{HfDevSelect, HfMuxState, HostFlash};
 use drv_sprot_api::SpRot;
 use drv_stm32xx_sys_api as sys_api;
@@ -37,7 +39,7 @@ use task_host_sp_comms_api::HostSpCommsError;
 use task_net_api::Net;
 use task_packrat_api::Packrat;
 use userlib::{
-    hl, sys_get_timer, sys_irq_control, task_slot, FromPrimitive, UnwrapLite,
+    sys_get_timer, sys_irq_control, task_slot, FromPrimitive, UnwrapLite,
 };
 
 mod inventory;
@@ -55,18 +57,21 @@ use inventory::INVENTORY_API_VERSION;
 )]
 #[cfg_attr(target_board = "gimletlet-2", path = "bsp/gimletlet.rs")]
 #[cfg_attr(target_board = "grapefruit", path = "bsp/grapefruit.rs")]
+#[cfg_attr(target_board = "cosmo-a", path = "bsp/cosmo_a.rs")]
 mod bsp;
+
+use bsp::SP_TO_HOST_CPU_INT_L;
 
 mod tx_buf;
 use tx_buf::TxBuf;
 
 task_slot!(CONTROL_PLANE_AGENT, control_plane_agent);
 task_slot!(CPU_SEQ, cpu_seq);
-task_slot!(HOST_FLASH, hf);
 task_slot!(PACKRAT, packrat);
 task_slot!(NET, net);
 task_slot!(SYS, sys);
 task_slot!(SPROT, sprot);
+task_slot!(pub HOST_FLASH, hf);
 
 // TODO: When rebooting the host, we need to wait for the relevant power rails
 // to decay. We ought to do this properly by monitoring the rails, but for now,
@@ -103,6 +108,12 @@ enum Trace {
     UartRxOverrun,
     ParseError(#[count(children)] DecodeFailureReason),
     SetState {
+        now: u64,
+        #[count(children)]
+        state: PowerState,
+        why: StateChangeReason,
+    },
+    AlreadyInState {
         now: u64,
         #[count(children)]
         state: PowerState,
@@ -251,6 +262,10 @@ struct ServerImpl {
     reboot_state: Option<RebootState>,
     host_kv_storage: HostKeyValueStorage,
     hf_mux_state: Option<HfMuxState>,
+
+    /// Temporary space for inventory data, which is a large `enum`
+    scratch: &'static mut host_sp_messages::InventoryData,
+
     /// Set when the host OS fails to boot or panics, and unset when the system
     /// reboots.
     ///
@@ -279,6 +294,7 @@ impl ServerImpl {
             last_panic: [u8; MAX_HOST_FAIL_MESSAGE_LEN],
             etc_system: [u8; MAX_ETC_SYSTEM_LEN],
             dtrace_conf: [u8; MAX_DTRACE_CONF_LEN],
+            scratch: host_sp_messages::InventoryData,
         }
         let Bufs {
             ref mut tx_buf,
@@ -287,6 +303,7 @@ impl ServerImpl {
             ref mut last_panic,
             ref mut etc_system,
             ref mut dtrace_conf,
+            ref mut scratch,
         } = {
             static BUFS: ClaimOnceCell<Bufs> = ClaimOnceCell::new(Bufs {
                 tx_buf: tx_buf::StaticBufs::new(),
@@ -295,6 +312,12 @@ impl ServerImpl {
                 last_panic: [0; MAX_HOST_FAIL_MESSAGE_LEN],
                 etc_system: [0; MAX_ETC_SYSTEM_LEN],
                 dtrace_conf: [0; MAX_DTRACE_CONF_LEN],
+
+                // Default value for InventoryData
+                scratch: host_sp_messages::InventoryData::DimmSpd {
+                    id: [0u8; 512],
+                    temp_sensor: 0u32,
+                },
             });
             BUFS.claim()
         };
@@ -325,6 +348,7 @@ impl ServerImpl {
             },
             hf_mux_state: None,
             last_power_off: None,
+            scratch,
         }
     }
 
@@ -391,26 +415,40 @@ impl ServerImpl {
             // Attempt to move to A2; given we only call this function in
             // response to a host request, we expect we're currently in A0 and
             // this should work.
-            let err =
-                match self.sequencer.set_state_with_reason(PowerState::A2, why)
-                {
-                    Ok(()) => {
-                        ringbuf_entry!(Trace::SetState {
-                            now: sys_get_timer().now,
-                            why,
-                            state: PowerState::A2,
-                        });
-                        if reboot {
-                            self.reboot_state = Some(RebootState::WaitingForA2);
-                        }
+            match self.sequencer.set_state_with_reason(PowerState::A2, why) {
+                Ok(Transition::Changed) => {
+                    ringbuf_entry!(Trace::SetState {
+                        now: sys_get_timer().now,
+                        why,
+                        state: PowerState::A2,
+                    });
+                    if reboot {
+                        self.reboot_state = Some(RebootState::WaitingForA2);
+                    }
+                    return;
+                }
+                Ok(Transition::Unchanged) => {
+                    // We're already in A2.
+                    ringbuf_entry!(Trace::AlreadyInState {
+                        now: sys_get_timer().now,
+                        why,
+                        state: PowerState::A2,
+                    });
+
+                    // If we're not trying to reboot, we're done.
+                    //
+                    // TODO(eliza): perhaps we ought to  have a way to indicate
+                    // this to up-stack software...
+                    if !reboot {
                         return;
                     }
-                    Err(err) => err,
-                };
-
-            // The only error we should see from `set_state()` is an illegal
-            // transition, if we're not currently in A0.
-            assert!(matches!(err, SeqError::IllegalTransition));
+                }
+                Err(err) => {
+                    // The only error we should see from `set_state()` is an illegal
+                    // transition, if we're not currently in A0.
+                    assert!(matches!(err, SeqError::IllegalTransition));
+                }
+            };
 
             // If we can't go to A2, what state are we in, keeping in mind that
             // we have a bit of TOCTOU here in that the state might've changed
@@ -442,12 +480,6 @@ impl ServerImpl {
                     }
                     return;
                 }
-
-                // A1 should be transitory; sleep then retry.
-                PowerState::A1 => {
-                    hl::sleep_for(1);
-                    continue;
-                }
             }
         }
     }
@@ -472,7 +504,6 @@ impl ServerImpl {
                         Some(RebootState::WaitingInA2RebootDelay);
                 }
             }
-            PowerState::A1 => (), // do nothing
             PowerState::A0Reset => {
                 // We have spontaneously reset.  We are in A0 (and indeed,
                 // by time we get this, the ABL is presumably running), but
@@ -774,11 +805,6 @@ impl ServerImpl {
                 // flash task? That should only happen if `hf` is unable to
                 // respond to us at all, which makes it seem unlikely that the
                 // host could even be up. We'll default to returning Bsu::A.
-                //
-                // Minor TODO: Attempting to get the BSU on a gimletlet will
-                // hang, because the host-flash task hangs indefinitely. We
-                // could replace gimlet-hf-server with a fake on gimletlet if
-                // that becomes onerous.
                 let bsu = match self.hf.get_dev() {
                     Ok(HfDevSelect::Flash0) | Err(_) => Bsu::A,
                     Ok(HfDevSelect::Flash1) => Bsu::B,
@@ -1358,17 +1384,18 @@ impl NotificationHandler for ServerImpl {
             | notifications::CONTROL_PLANE_AGENT_MASK
     }
 
-    fn handle_notification(&mut self, bits: u32) {
-        if bits & notifications::USART_IRQ_MASK != 0 {
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.check_notification_mask(notifications::USART_IRQ_MASK) {
             self.handle_usart_notification();
             sys_irq_control(notifications::USART_IRQ_MASK, true);
         }
 
-        if bits & notifications::JEFE_STATE_CHANGE_MASK != 0 {
+        if bits.check_notification_mask(notifications::JEFE_STATE_CHANGE_MASK) {
             self.handle_jefe_notification(self.sequencer.get_state());
         }
 
-        if bits & notifications::CONTROL_PLANE_AGENT_MASK != 0 {
+        if bits.check_notification_mask(notifications::CONTROL_PLANE_AGENT_MASK)
+        {
             self.handle_control_plane_agent_notification();
         }
 
@@ -1377,7 +1404,7 @@ impl NotificationHandler for ServerImpl {
         // We'll record whether or not we want to clear the timer in this
         // variable, then actually clear it (if needed) after the loop over the
         // fired timers.
-        self.timers.handle_notification(bits);
+        self.timers.handle_notification(bits.get_raw_bits());
         let mut tx_timer_disposition = TimerDisposition::LeaveRunning;
         for t in self.timers.iter_fired() {
             match t {
@@ -1452,12 +1479,29 @@ fn handle_reboot_waiting_in_a2_timer(
         // longer in A2. In either case (we successfully started the
         // transition or we're no longer in A2 due to some external cause),
         // we've done what we can to reboot, so clear out `reboot_state`.
-        ringbuf_entry!(Trace::SetState {
-            now: sys_get_timer().now,
-            why,
-            state: PowerState::A0,
-        });
-        _ = sequencer.set_state_with_reason(PowerState::A0, why);
+        match sequencer.set_state_with_reason(PowerState::A0, why) {
+            Ok(Transition::Changed) => {
+                ringbuf_entry!(Trace::SetState {
+                    now: sys_get_timer().now,
+                    why,
+                    state: PowerState::A0,
+                });
+            }
+            Ok(Transition::Unchanged) => {
+                ringbuf_entry!(Trace::AlreadyInState {
+                    now: sys_get_timer().now,
+                    why,
+                    state: PowerState::A0,
+                })
+            }
+            Err(_) => {
+                // Yes, ignore this error. It will have been recorded in the
+                // sequencer client ringbuf, and should not fail unless we are
+                // in A1 already (in which case we will see "illegal
+                // transition", but we are already on our way to A0, so it's
+                // fine).
+            }
+        }
         *reboot_state = None;
     }
 }
@@ -1547,8 +1591,7 @@ fn configure_uart_device(sys: &sys_api::Sys) -> Usart {
     #[cfg(feature = "baud_rate_3M")]
     const BAUD_RATE: u32 = 3_000_000;
 
-    #[cfg(feature = "hardware_flow_control")]
-    let hardware_flow_control = true;
+    let hardware_flow_control = cfg!(feature = "hardware_flow_control");
 
     cfg_if::cfg_if! {
         if #[cfg(feature = "uart7")] {
@@ -1583,6 +1626,22 @@ fn configure_uart_device(sys: &sys_api::Sys) -> Usart {
             let usart = unsafe { &*device::USART6::ptr() };
             let peripheral = Peripheral::Usart6;
             let pins = PINS;
+        } else if #[cfg(feature = "uart8")] {
+            const PINS: &[(PinSet, Alternate)] = {
+                cfg_if::cfg_if! {
+                    if #[cfg(feature = "hardware_flow_control")] {
+                        compile_error!("hardware_flow_control should be disabled");
+                    } else {
+                        &[(
+                            Port::J.pin(8).and_pin(9),
+                            Alternate::AF8
+                        )]
+                    }
+                }
+            };
+            let usart = unsafe { &*device::UART8::ptr() };
+            let peripheral = Peripheral::Uart8;
+            let pins = PINS;
         } else {
             compile_error!("no usartX/uartX feature specified");
         }
@@ -1599,35 +1658,12 @@ fn configure_uart_device(sys: &sys_api::Sys) -> Usart {
     )
 }
 
-cfg_if::cfg_if! {
-    if #[cfg(any(
-        target_board = "gimlet-b",
-        target_board = "gimlet-c",
-        target_board = "gimlet-d",
-        target_board = "gimlet-e",
-        target_board = "gimlet-f",
-    ))] {
-        // This net is named SP_TO_SP3_INT_L in the schematic
-        const SP_TO_HOST_CPU_INT_L: sys_api::PinSet = sys_api::Port::I.pin(7);
-    } else if #[cfg(target_board = "gimletlet-2")] {
-        // gimletlet doesn't have an SP3 to interrupt, but we can wire up an LED
-        // to one of the exposed E2-E6 pins to see it visually.
-        const SP_TO_HOST_CPU_INT_L: sys_api::PinSet = sys_api::Port::E.pin(2);
-    } else if #[cfg(target_board = "grapefruit")] {
-        // the CPU interrupt is not connected on grapefruit, so pick an
-        // unconnected GPIO
-        const SP_TO_HOST_CPU_INT_L: sys_api::PinSet = sys_api::Port::B.pin(1);
-    } else {
-        compile_error!("unsupported target board");
-    }
-}
-
 fn sp_to_sp3_interrupt_enable(sys: &sys_api::Sys) {
     sys.gpio_set(SP_TO_HOST_CPU_INT_L);
 
     sys.gpio_configure_output(
         SP_TO_HOST_CPU_INT_L,
-        sys_api::OutputType::OpenDrain,
+        bsp::SP_TO_HOST_CPU_INT_TYPE,
         sys_api::Speed::Low,
         sys_api::Pull::None,
     );

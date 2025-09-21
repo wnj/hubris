@@ -37,6 +37,7 @@ pub type Isr = device::i2c1::isr::R;
 
 pub mod ltc4306;
 pub mod max7358;
+pub mod oximux16;
 pub mod pca9545;
 pub mod pca9548;
 
@@ -65,27 +66,6 @@ pub struct I2cController<'a> {
     pub registers: &'a RegisterBlock,
 }
 
-///
-/// A structure to denote an absolute number of ticks to wait.
-///
-pub struct I2cTimeout(pub u64);
-
-pub enum I2cControlResult {
-    Interrupted,
-    TimedOut,
-}
-
-///
-/// A structure that defines interrupt control flow functions that will be
-/// used to pass control flow into the kernel to either enable or wait for
-/// interrupts.  Note that this is deliberately a struct and not a trait,
-/// allowing the [`I2cMuxDriver`] trait to itself be a trait object.
-///
-pub struct I2cControl {
-    pub enable: fn(u32),
-    pub wfi: fn(u32, I2cTimeout) -> I2cControlResult,
-}
-
 pub struct I2cTargetControl {
     pub enable: fn(u32),
     pub wfi: fn(u32),
@@ -108,7 +88,6 @@ pub trait I2cMuxDriver {
         mux: &I2cMux<'_>,
         controller: &I2cController<'_>,
         sys: &sys_api::Sys,
-        ctrl: &I2cControl,
     ) -> Result<(), drv_i2c_api::ResponseCode>;
 
     /// Reset the mux
@@ -125,7 +104,6 @@ pub trait I2cMuxDriver {
         mux: &I2cMux<'_>,
         controller: &I2cController<'_>,
         segment: Option<drv_i2c_api::Segment>,
-        ctrl: &I2cControl,
     ) -> Result<(), drv_i2c_api::ResponseCode>;
 }
 
@@ -160,16 +138,13 @@ pub enum ReadLength {
 enum Register {
     CR1,
     CR2,
-    OAR1,
-    OAR2,
-    TIMINGR,
-    TIMEOUTR,
     ISR,
-    PECR,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, counters::Count)]
 enum Trace {
+    #[count(skip)]
+    None,
     Wait(Register, u32),
     Write(Register, u32),
     WriteWait(Register, u32),
@@ -194,18 +169,6 @@ enum Trace {
     BusySleep,
     Stop,
     RepeatedStart(#[count(children)] bool),
-    LostInterrupt,
-    #[count(skip)]
-    Panic(Register, u32),
-    #[count(skip)]
-    IrqStatus {
-        notification: u32,
-        pending: bool,
-        enabled: bool,
-        posted: bool,
-    },
-    #[count(skip)]
-    None,
 }
 
 counted_ringbuf!(Trace, 48, Trace::None);
@@ -468,70 +431,13 @@ impl I2cController<'_> {
     }
 
     ///
-    /// A routine to panic.  This should not be called merely because something
-    /// has gone wrong with a device (which should rather be indicated by
-    /// returning an error and resetting the controller if/as needed), but with
-    /// the controller itself.
+    /// A common routine to wait for any of our interrupt-related notification
+    /// bits. Note that you'll still want to check the actual interrupt status
+    /// bits to distinguish a real interrupt from a stale or mischieviously
+    /// posted notification bit.
     ///
-    fn panic(&self) -> ! {
-        let i2c = self.registers;
-        let tgr = &i2c.timingr;
-        let tor = &i2c.timeoutr;
-
-        ringbuf_entry!(Trace::Panic(Register::CR1, i2c.cr1.read().bits()));
-        ringbuf_entry!(Trace::Panic(Register::CR2, i2c.cr2.read().bits()));
-        ringbuf_entry!(Trace::Panic(Register::OAR1, i2c.oar1.read().bits()));
-        ringbuf_entry!(Trace::Panic(Register::OAR2, i2c.oar2.read().bits()));
-        ringbuf_entry!(Trace::Panic(Register::TIMINGR, tgr.read().bits()));
-        ringbuf_entry!(Trace::Panic(Register::TIMEOUTR, tor.read().bits()));
-        ringbuf_entry!(Trace::Panic(Register::ISR, i2c.isr.read().bits()));
-        ringbuf_entry!(Trace::Panic(Register::PECR, i2c.pecr.read().bits()));
-
-        let irq_status = sys_irq_status(self.notification);
-        ringbuf_entry!(Trace::IrqStatus {
-            notification: self.notification,
-            // Yes, we *could* just record the `IrqStatus` value here, but
-            // Humility will format it as a hex value rather than knowing about
-            // the bitflags, which is a bit sad...
-            enabled: irq_status.contains(IrqStatus::ENABLED),
-            pending: irq_status.contains(IrqStatus::PENDING),
-            posted: irq_status.contains(IrqStatus::POSTED),
-        });
-
-        panic!();
-    }
-
-    ///
-    /// A common routine to wait for interrupts with a timeout.
-    ///
-    fn wfi(&self, ctrl: &I2cControl) -> Result<(), drv_i2c_api::ResponseCode> {
-        //
-        // A 100 ms timeout is much, much longer than the I2C timeouts.
-        //
-        const TIMEOUT: I2cTimeout = I2cTimeout(100);
-
-        match (ctrl.wfi)(self.notification, TIMEOUT) {
-            I2cControlResult::TimedOut => {
-                //
-                // This really shouldn't happen:  it means that not only did
-                // we not get our expected interrupt, but that the configured
-                // timeout in the I2C block also didn't function as expected.
-                // That said, we got our OS timer interrupt (or we wouldn't be
-                // here at all), which gives us at least control.  While we
-                // could conceivably return an error code in this condition,
-                // this condition is so unexpected that we want to instead
-                // make sure we can debug it:  we are going to instead call
-                // our panic routine, which will record some additional data
-                // from the I2C controller and explicitly panic.  This will
-                // result in a dump that will effectively preserve this state,
-                // and will (hopefuflly) allow it to be debugged long after it
-                // happens.
-                //
-                ringbuf_entry!(Trace::LostInterrupt);
-                self.panic();
-            }
-            I2cControlResult::Interrupted => Ok(()),
-        }
+    fn wfi(&self) {
+        sys_recv_notification(self.notification);
     }
 
     fn wait_until_notbusy(&self) -> Result<(), drv_i2c_api::ResponseCode> {
@@ -606,7 +512,6 @@ impl I2cController<'_> {
         getbyte: impl Fn(usize) -> Option<u8>,
         mut rlen: ReadLength,
         mut putbyte: impl FnMut(usize, u8) -> Option<()>,
-        ctrl: &I2cControl,
     ) -> Result<(), drv_i2c_api::ResponseCode> {
         // Assert our preconditions as described above
         assert!(wlen > 0 || rlen != ReadLength::Fixed(0));
@@ -651,8 +556,8 @@ impl I2cController<'_> {
                         break;
                     }
 
-                    self.wfi(ctrl)?;
-                    (ctrl.enable)(notification);
+                    self.wfi();
+                    sys_irq_control(notification, true);
                 }
 
                 // Get a single byte.
@@ -681,8 +586,8 @@ impl I2cController<'_> {
                     break;
                 }
 
-                self.wfi(ctrl)?;
-                (ctrl.enable)(notification);
+                self.wfi();
+                sys_irq_control(notification, true);
             }
         }
 
@@ -729,8 +634,8 @@ impl I2cController<'_> {
                 }
 
                 loop {
-                    self.wfi(ctrl)?;
-                    (ctrl.enable)(notification);
+                    self.wfi();
+                    sys_irq_control(notification, true);
 
                     let isr = i2c.isr.read();
                     ringbuf_entry!(Trace::Read(Register::ISR, isr.bits()));
@@ -784,8 +689,8 @@ impl I2cController<'_> {
 
                 self.check_errors(&isr)?;
 
-                self.wfi(ctrl)?;
-                (ctrl.enable)(notification);
+                self.wfi();
+                sys_irq_control(notification, true);
             }
         }
 
@@ -819,7 +724,6 @@ impl I2cController<'_> {
         &self,
         addr: u8,
         ops: &[I2cKonamiCode],
-        ctrl: &I2cControl,
     ) -> Result<(), drv_i2c_api::ResponseCode> {
         let i2c = self.registers;
         let notification = self.notification;
@@ -863,8 +767,8 @@ impl I2cController<'_> {
                     break;
                 }
 
-                self.wfi(ctrl)?;
-                (ctrl.enable)(notification);
+                self.wfi();
+                sys_irq_control(notification, true);
             }
         }
 

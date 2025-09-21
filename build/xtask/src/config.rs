@@ -23,6 +23,7 @@ struct RawConfig {
     target: String,
     board: String,
     chip: String,
+    mmio: Option<MmioConfig>,
     #[serde(default)]
     epoch: u32,
     #[serde(default)]
@@ -44,6 +45,19 @@ struct RawConfig {
     caboose: Option<CabooseConfig>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MmioConfig {
+    pub peripheral_region: String,
+    pub register_map: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct MmioData {
+    pub base_address: u32,
+    pub register_map: PathBuf,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub name: String,
@@ -51,6 +65,7 @@ pub struct Config {
     pub board: String,
     pub chip: String,
     pub epoch: u32,
+    pub mmio: Option<MmioData>,
     pub version: u32,
     pub fwid: bool,
     pub image_names: Vec<String>,
@@ -97,10 +112,6 @@ pub struct CabooseConfig {
     /// The system reserves two words (8 bytes) for the size and marker, so the
     /// user-accessible space is 8 bytes less than this value.
     pub size: u32,
-
-    /// If `true`, populates the caboose with default values using `hubtools`
-    #[serde(default)]
-    pub default: bool,
 }
 
 impl Config {
@@ -130,12 +141,69 @@ impl Config {
         // The app.toml must include a `chip` key, which defines the peripheral
         // register map in a separate file.  We load it then accumulate that
         // file in the buildhash.
-        let peripherals = {
+        let mut peripherals: IndexMap<String, Peripheral> = {
             let chip_file =
                 cfg.parent().unwrap().join(&toml.chip).join("chip.toml");
             let chip_contents = std::fs::read(chip_file)?;
             hasher.write(&chip_contents);
             toml::from_str(std::str::from_utf8(&chip_contents)?)?
+        };
+
+        // The manifest may also include a `mmio` key, which defines extra
+        // memory-mapped peripherals attached over a memory bus
+        let mmio = if let Some(mmio) = &toml.mmio {
+            let Some(p) = peripherals.get(&mmio.peripheral_region) else {
+                bail!(
+                    "could not find peripheral region '{}'",
+                    mmio.peripheral_region
+                );
+            };
+            let base_address = p.address;
+            use build_fpga_regmap::Node;
+
+            let mmio_file = cfg.parent().unwrap().join(&mmio.register_map);
+            let mmio_contents = std::fs::read(&mmio_file)?;
+            hasher.write(&mmio_contents);
+
+            let root: Node =
+                serde_json::from_str(std::str::from_utf8(&mmio_contents)?)
+                    .with_context(|| {
+                        format!(
+                            "failed to read MMIO register map at {:?}",
+                            mmio.register_map
+                        )
+                    })?;
+
+            let Node::Addrmap { children, .. } = root else {
+                bail!("top-level node is not addrmap");
+            };
+            for (i, p) in children.iter().enumerate() {
+                let Node::Addrmap {
+                    inst_name,
+                    addr_offset,
+                    ..
+                } = &p
+                else {
+                    bail!("second-level node must be Addrmap");
+                };
+                if *addr_offset != i * 256 {
+                    bail!("mmio peripherals must be spaced at 256 bytes");
+                }
+                peripherals.insert(
+                    format!("mmio_{inst_name}"),
+                    Peripheral {
+                        address: *addr_offset as u32 + base_address,
+                        size: 256,
+                        interrupts: BTreeMap::new(),
+                    },
+                );
+            }
+            Some(MmioData {
+                base_address,
+                register_map: mmio_file.canonicalize()?,
+            })
+        } else {
+            None
         };
 
         let outputs: IndexMap<String, Vec<Output>> = {
@@ -174,6 +242,7 @@ impl Config {
             board: toml.board,
             image_names: img_names,
             chip: toml.chip,
+            mmio,
             epoch: toml.epoch,
             version: toml.version,
             fwid: toml.fwid,
@@ -275,6 +344,17 @@ impl Config {
                     format!("{:?}", checksum),
                 );
             }
+        }
+
+        if let Some(mmio) = &self.mmio {
+            env.insert(
+                "HUBRIS_MMIO_BASE_ADDRESS".to_string(),
+                mmio.base_address.to_string(),
+            );
+            env.insert(
+                "HUBRIS_MMIO_REGISTER_MAP".to_string(),
+                mmio.register_map.to_str().unwrap().to_owned(),
+            );
         }
 
         if let Some(app_config) = &self.config {
@@ -501,10 +581,27 @@ impl Config {
         task: &str,
         image_name: &str,
     ) -> Result<IndexMap<String, Range<u32>>> {
-        self.tasks
+        let extern_regions = &self
+            .tasks
             .get(task)
             .ok_or_else(|| anyhow!("no such task {task}"))?
-            .extern_regions
+            .extern_regions;
+        self.get_extern_regions(extern_regions, image_name)
+    }
+
+    pub fn kernel_extern_regions(
+        &self,
+        image_name: &str,
+    ) -> Result<IndexMap<String, Range<u32>>> {
+        self.get_extern_regions(&self.kernel.extern_regions, image_name)
+    }
+
+    fn get_extern_regions(
+        &self,
+        extern_regions: &Vec<String>,
+        image_name: &str,
+    ) -> Result<IndexMap<String, Range<u32>>> {
+        extern_regions
             .iter()
             .map(|r| {
                 let mut regions = self
@@ -630,6 +727,8 @@ pub struct Kernel {
     pub features: Vec<String>,
     #[serde(default)]
     pub no_default_features: bool,
+    #[serde(default)]
+    pub extern_regions: Vec<String>,
 }
 
 fn default_name() -> String {
@@ -700,12 +799,7 @@ impl BuildConfig<'_> {
 
         let mut nightly_features = vec![];
         // nightly features that we use:
-        nightly_features.extend([
-            "asm_const",
-            "emit_stack_sizes",
-            "naked_functions",
-            "used_with_arg",
-        ]);
+        nightly_features.extend(["emit_stack_sizes", "used_with_arg"]);
         // nightly features that our dependencies use:
         nightly_features.extend([
             "backtrace",
@@ -735,7 +829,7 @@ fn read_and_flatten_toml(
     cfg: &Path,
     hasher: &mut DefaultHasher,
     seen: &mut BTreeSet<PathBuf>,
-) -> Result<toml_edit::Document> {
+) -> Result<toml_edit::DocumentMut> {
     use toml_patch::merge_toml_documents;
 
     // Prevent diamond inheritance
@@ -757,7 +851,7 @@ fn read_and_flatten_toml(
 
     // Additive TOML file inheritance
     let mut doc = cfg_contents
-        .parse::<toml_edit::Document>()
+        .parse::<toml_edit::DocumentMut>()
         .context("failed to parse TOML file")?;
     let Some(inherited_from) = doc.remove("inherit") else {
         // No further inheritance, so return the current document
@@ -774,11 +868,11 @@ fn read_and_flatten_toml(
         }
         // Multiple inheritance, applied sequentially
         Item::Value(Value::Array(a)) => {
-            let mut doc: Option<toml_edit::Document> = None;
+            let mut doc: Option<toml_edit::DocumentMut> = None;
             for a in a.iter() {
                 if let Value::String(s) = a {
                     let file = cfg.parent().unwrap().join(s.value());
-                    let next: toml_edit::Document =
+                    let next: toml_edit::DocumentMut =
                         read_and_flatten_toml(&file, hasher, seen)
                             .with_context(|| {
                                 format!("Could not load {file:?}")

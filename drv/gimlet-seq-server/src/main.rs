@@ -17,7 +17,7 @@ use userlib::{
     sys_set_timer, task_slot, units, RecvMessage, TaskId, UnwrapLite,
 };
 
-use drv_cpu_seq_api::{PowerState, SeqError, StateChangeReason};
+use drv_cpu_seq_api::{PowerState, SeqError, StateChangeReason, Transition};
 use drv_hf_api as hf_api;
 use drv_i2c_api as i2c;
 use drv_ice40_spi_program as ice40;
@@ -50,6 +50,10 @@ include!(concat!(env!("OUT_DIR"), "/i2c_config.rs"));
 )]
 mod payload;
 
+/// Types for more ergonomic access to FPGA generated types
+pub type A1SmStatus = Reg::A1SMSTATUS::A1SmEncoded;
+pub type A0SmStatus = Reg::A0SMSTATUS::A0SmEncoded;
+
 #[derive(Copy, Clone, PartialEq, Count)]
 enum I2cTxn {
     SpdLoad(u8, u8),
@@ -57,12 +61,15 @@ enum I2cTxn {
     VCoreOn,
     VCoreOff,
     VCoreUndervoltageInitialize,
+    VCorePmbusStatus,
     SocOn,
     SocOff,
 }
 
 #[derive(Copy, Clone, PartialEq, Count)]
 enum Trace {
+    #[count(skip)]
+    None,
     Ice40Rails(bool, bool),
     IdentValid(#[count(children)] bool),
     ChecksumValid(#[count(children)] bool),
@@ -77,14 +84,16 @@ enum Trace {
     A2,
     A0FailureDetails(Addr, u8),
     A0Failed(#[count(children)] SeqError),
-    A1Status(u8),
+    A1Status(Result<A1SmStatus, u8>),
+    A1Readbacks(u8),
+    A1OutStatus(u8),
     CPUPresent(#[count(children)] bool),
     Coretype {
         coretype: bool,
         sp3r1: bool,
         sp3r2: bool,
     },
-    A0Status(u8),
+    A0Status(Result<A0SmStatus, u8>),
     A0Power(u8),
     NICPowerEnableLow(bool),
     RailsOn,
@@ -112,8 +121,8 @@ enum Trace {
         nic: u8,
     },
     SMStatus {
-        a1: u8,
-        a0: u8,
+        a1: Result<A1SmStatus, u8>,
+        a0: Result<A0SmStatus, u8>,
     },
     NICStatus {
         nic_ctrl: u8,
@@ -144,8 +153,6 @@ enum Trace {
         retries_remaining: u8,
     },
     StartFailed(#[count(children)] SeqError),
-    #[count(skip)]
-    None,
 }
 
 counted_ringbuf!(Trace, 128, Trace::None);
@@ -194,9 +201,13 @@ struct ServerImpl<S: SpiServer> {
     hf: hf_api::HostFlash,
     vcore: vcore::VCore,
     deadline: u64,
+    // Buffer for encoding ereports. This is a static so that it's not on the
+    // stack when handling interrupts.
+    ereport_buf: &'static mut [u8; EREPORT_BUF_LEN],
 }
 
 const TIMER_INTERVAL: u32 = 10;
+const EREPORT_BUF_LEN: usize = 256;
 
 impl<S: SpiServer + Clone> ServerImpl<S> {
     fn init(
@@ -476,6 +487,13 @@ impl<S: SpiServer + Clone> ServerImpl<S> {
 
         let (device, rail) = i2c_config::pmbus::vdd_vcore(I2C.get_task_id());
 
+        let ereport_buf = {
+            use static_cell::ClaimOnceCell;
+            static EREPORT_BUF: ClaimOnceCell<[u8; EREPORT_BUF_LEN]> =
+                ClaimOnceCell::new([0; EREPORT_BUF_LEN]);
+            EREPORT_BUF.claim()
+        };
+
         let mut server = Self {
             state: PowerState::A2,
             sys: sys.clone(),
@@ -483,7 +501,8 @@ impl<S: SpiServer + Clone> ServerImpl<S> {
             jefe,
             hf,
             deadline: 0,
-            vcore: vcore::VCore::new(sys, &device, rail),
+            vcore: vcore::VCore::new(sys, packrat, &device, rail),
+            ereport_buf,
         };
 
         // Power on, unless suppressed by the `stay-in-a2` feature
@@ -521,12 +540,12 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
         notifications::TIMER_MASK | self.vcore.mask()
     }
 
-    fn handle_notification(&mut self, bits: u32) {
-        if (bits & self.vcore.mask()) != 0 {
-            self.vcore.handle_notification();
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.check_notification_mask(self.vcore.mask()) {
+            self.vcore.handle_notification(self.ereport_buf);
         }
 
-        if (bits & notifications::TIMER_MASK) == 0 {
+        if !bits.has_timer_fired(notifications::TIMER_MASK) {
             return;
         }
 
@@ -612,9 +631,7 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
                     //
                 }
 
-                (PowerState::A2, _)
-                | (PowerState::A2PlusFans, _)
-                | (PowerState::A1, _) => {
+                (PowerState::A2, _) | (PowerState::A2PlusFans, _) => {
                     //
                     // We can only be in this larger block if the state is A0
                     // or A0PlusHP; we must have matched one of the arms above.
@@ -676,7 +693,7 @@ impl<S: SpiServer> ServerImpl<S> {
         &mut self,
         state: PowerState,
         why: StateChangeReason,
-    ) -> Result<(), SeqError> {
+    ) -> Result<Transition, SeqError> {
         let sys = sys_api::Sys::from(SYS.get_task_id());
 
         let now = sys_get_timer().now;
@@ -695,9 +712,11 @@ impl<S: SpiServer> ServerImpl<S> {
             nic: self.seq.read_byte(Addr::NIC_STATUS).unwrap_lite(),
         });
 
+        let a1: u8 = self.seq.read_byte(Addr::A1SMSTATUS).unwrap_lite();
+        let a0: u8 = self.seq.read_byte(Addr::A0SMSTATUS).unwrap_lite();
         ringbuf_entry!(Trace::SMStatus {
-            a1: self.seq.read_byte(Addr::A1SMSTATUS).unwrap_lite(),
-            a0: self.seq.read_byte(Addr::A0SMSTATUS).unwrap_lite(),
+            a1: A1SmStatus::try_from(a1),
+            a0: A0SmStatus::try_from(a0),
         });
 
         ringbuf_entry!(Trace::PowerControl(
@@ -741,14 +760,30 @@ impl<S: SpiServer> ServerImpl<S> {
                 self.seq.set_bytes(Addr::PWR_CTRL, &[a1]).unwrap_lite();
 
                 loop {
+                    let mut readbacks = [0u8];
+
+                    self.seq
+                        .read_bytes(Addr::A1_READBACKS, &mut readbacks)
+                        .unwrap_lite();
+                    ringbuf_entry!(Trace::A1Readbacks(readbacks[0]));
+
+                    let mut out_status = [0u8];
+
+                    self.seq
+                        .read_bytes(Addr::A1_OUT_STATUS, &mut out_status)
+                        .unwrap_lite();
+                    ringbuf_entry!(Trace::A1OutStatus(out_status[0]));
+
                     let mut status = [0u8];
 
                     self.seq
                         .read_bytes(Addr::A1SMSTATUS, &mut status)
                         .unwrap_lite();
-                    ringbuf_entry!(Trace::A1Status(status[0]));
 
-                    if status[0] == Reg::A1SMSTATUS::A1SmEncoded::Done as u8 {
+                    let a1sm = A1SmStatus::try_from(status[0]);
+                    ringbuf_entry!(Trace::A1Status(a1sm));
+
+                    if a1sm == Ok(A1SmStatus::Done) {
                         break;
                     }
 
@@ -802,10 +837,11 @@ impl<S: SpiServer> ServerImpl<S> {
                     self.seq
                         .read_bytes(Addr::A0SMSTATUS, &mut status)
                         .unwrap_lite();
-                    ringbuf_entry!(Trace::A0Status(status[0]));
 
-                    if status[0] == Reg::A0SMSTATUS::A0SmEncoded::GroupcPg as u8
-                    {
+                    let a0sm = A0SmStatus::try_from(status[0]);
+                    ringbuf_entry!(Trace::A0Status(a0sm));
+
+                    if a0sm == Ok(A0SmStatus::GroupcPg) {
                         break;
                     }
 
@@ -870,7 +906,7 @@ impl<S: SpiServer> ServerImpl<S> {
                 ));
 
                 self.update_state_internal(PowerState::A0);
-                Ok(())
+                Ok(Transition::Changed)
             }
 
             (PowerState::A0, PowerState::A2)
@@ -928,10 +964,12 @@ impl<S: SpiServer> ServerImpl<S> {
                     ringbuf_entry_v3p3_sys_a0_vout();
                 }
 
-                Ok(())
+                Ok(Transition::Changed)
             }
-
-            _ => Err(SeqError::IllegalTransition),
+            (current, requested) if current == requested => {
+                Ok(Transition::Unchanged)
+            }
+            (_, _) => Err(SeqError::IllegalTransition),
         }
     }
 
@@ -1048,7 +1086,7 @@ impl<S: SpiServer> idl::InOrderSequencerImpl for ServerImpl<S> {
         &mut self,
         _: &RecvMessage,
         state: PowerState,
-    ) -> Result<(), RequestError<SeqError>> {
+    ) -> Result<Transition, RequestError<SeqError>> {
         self.set_state_internal(state, StateChangeReason::Other)
             .map_err(RequestError::from)
     }
@@ -1058,7 +1096,7 @@ impl<S: SpiServer> idl::InOrderSequencerImpl for ServerImpl<S> {
         _: &RecvMessage,
         state: PowerState,
         reason: StateChangeReason,
-    ) -> Result<(), RequestError<SeqError>> {
+    ) -> Result<Transition, RequestError<SeqError>> {
         self.set_state_internal(state, reason)
             .map_err(RequestError::from)
     }
@@ -1147,7 +1185,8 @@ fn read_spd_data_and_load_packrat(
         let addr = spd::Function::PageAddress(spd::Page(0))
             .to_device_code()
             .unwrap_lite();
-        let page = I2cDevice::new(i2c_task, controller, port, None, addr);
+        let page =
+            I2cDevice::new(i2c_task, controller, port, None, addr, "SPD");
 
         if page.write(&[0]).is_err() {
             // If our operation fails, we are going to assume that there
@@ -1158,7 +1197,8 @@ fn read_spd_data_and_load_packrat(
 
         for i in 0..spd::MAX_DEVICES {
             let mem = spd::Function::Memory(i).to_device_code().unwrap_lite();
-            let spd = I2cDevice::new(i2c_task, controller, port, mux, mem);
+            let spd =
+                I2cDevice::new(i2c_task, controller, port, mux, mem, "SPD");
             let ndx = (nbank * spd::MAX_DEVICES) + i;
 
             // Try reading the first byte; if this fails, we will assume
@@ -1193,14 +1233,15 @@ fn read_spd_data_and_load_packrat(
                 spd.read_into(&mut tmp[1..])
             })?;
 
-            packrat.set_spd_eeprom(ndx, false, 0, &tmp);
+            packrat.set_spd_eeprom(ndx, 0, &tmp);
         }
 
         // Now flip over to the top page.
         let addr = spd::Function::PageAddress(spd::Page(1))
             .to_device_code()
             .unwrap_lite();
-        let page = I2cDevice::new(i2c_task, controller, port, None, addr);
+        let page =
+            I2cDevice::new(i2c_task, controller, port, None, addr, "SPD");
 
         // We really don't expect this to fail, and if it does, tossing here
         // seems to be best option:  things are pretty wrong.
@@ -1215,7 +1256,8 @@ fn read_spd_data_and_load_packrat(
             }
 
             let mem = spd::Function::Memory(i).to_device_code().unwrap_lite();
-            let spd = I2cDevice::new(i2c_task, controller, port, mux, mem);
+            let spd =
+                I2cDevice::new(i2c_task, controller, port, mux, mem, "SPD");
 
             let chunk = 128;
 
@@ -1229,7 +1271,7 @@ fn read_spd_data_and_load_packrat(
                 spd.read_into(&mut tmp[chunk..])
             })?;
 
-            packrat.set_spd_eeprom(ndx, true, 0, &tmp);
+            packrat.set_spd_eeprom(ndx, spd::PAGE_SIZE, &tmp);
         }
     }
 
@@ -1430,7 +1472,7 @@ cfg_if::cfg_if! {
 }
 
 mod idl {
-    use super::{SeqError, StateChangeReason};
+    use super::StateChangeReason;
 
     include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
 }

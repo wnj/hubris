@@ -12,9 +12,9 @@ requires = {flash = 32768, ram = 4096}
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = {flash = 8192, ram = 2048}
+max-sizes = {flash = 8192, ram = 4096}
 start = true
-stacksize = 1536
+stacksize = 2200
 notifications = ["fault", "timer"]
 
 [tasks.jefe.config.allowed-callers]
@@ -42,7 +42,7 @@ notifications = ["timer"]
 name = "task-hiffy"
 features = ["h753", "stm32h7", "gpio", "spi"]
 priority = 3
-max-sizes = {flash = 32768, ram = 16384 }
+max-sizes = {flash = 32768, ram = 65536 }
 stacksize = 2048
 start = true
 task-slots = ["sys", "user_leds"]
