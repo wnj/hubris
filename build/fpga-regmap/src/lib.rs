@@ -202,8 +202,11 @@ fn write_reg_fields(
                 writeln!(
                     output,
                     "
-{prefix}        #[derive(Copy, Clone, Eq, PartialEq)]
+{prefix}        use hubpack::SerializedSize;
+{prefix}        use serde::{{Deserialize, Serialize}};
+
 {prefix}        #[allow(dead_code)]
+{prefix}        #[derive(Copy, Clone, Eq, PartialEq, Serialize, Deserialize, SerializedSize)]
 {prefix}        pub enum {encode_name} {{"
                 )
                 .unwrap();
@@ -233,7 +236,8 @@ fn write_reg_fields(
 {prefix}            type Error = u8;
 {prefix}            fn try_from(x: u8) -> Result<Self, Self::Error> {{
 {prefix}                use crate::{parent_chain}::{encode_name}::*;
-{prefix}                let x_masked = x & {inst_name};
+{prefix}                let position = {inst_name}.trailing_zeros();
+{prefix}                let x_masked = (x & {inst_name}) >> position;
 {prefix}                match x_masked {{"
                 )
                 .unwrap();
@@ -449,6 +453,7 @@ pub fn build_peripheral(
             else {
                 panic!("nodes within register must be fields, not {c:?}");
             };
+            let desc = Some(desc.as_str()).filter(|s| !s.is_empty());
             let msb = u32::try_from(*msb).unwrap();
             let lsb = u32::try_from(*lsb).unwrap();
             let setter: syn::Ident =
@@ -458,9 +463,10 @@ pub fn build_peripheral(
                 syn::parse_str(&inst_name.to_snake_case()).unwrap();
             if lsb == msb {
                 if sw_access.is_write() {
+                    let doc = desc.into_iter();
                     struct_fns.push(quote! {
                         #[inline]
-                        #[doc = #desc]
+                        #(#[doc = #doc])*
                         pub fn #setter(&self, t: bool) {
                             let mut d = self.get_raw();
                             if t {
@@ -473,9 +479,10 @@ pub fn build_peripheral(
                     });
                 }
                 if sw_access.is_read() {
+                    let doc = desc.into_iter();
                     struct_fns.push(quote! {
                         #[inline]
-                        #[doc = #desc]
+                        #(#[doc = #doc])*
                         pub fn #getter(&self) -> bool {
                             let d = self.get_raw();
                             (d & (1 << #msb)) != 0
@@ -535,9 +542,10 @@ pub fn build_peripheral(
                     }
                 });
                 if sw_access.is_write() {
+                    let doc = desc.into_iter();
                     struct_fns.push(quote! {
                         #[inline]
-                        #[doc = #desc]
+                        #(#[doc = #doc])*
                         pub fn #setter(&self, t: #ty) {
                             let mut d = self.get_raw();
                             d &= !(#mask << #lsb);
@@ -547,9 +555,10 @@ pub fn build_peripheral(
                     });
                 }
                 if sw_access.is_read() {
+                    let doc = desc.into_iter();
                     struct_fns.push(quote! {
                         #[inline]
-                        #[doc = #desc]
+                        #(#[doc = #doc])*
                         pub fn #getter(&self) -> Result<#ty, #raw_ty> {
                             let d = self.get_raw();
                             let t = ((d >> #lsb) & #mask) as #raw_ty;
@@ -576,9 +585,10 @@ pub fn build_peripheral(
                 };
                 let ty: syn::Ident = syn::parse_str(ty).unwrap();
                 if sw_access.is_write() {
+                    let doc = desc.into_iter();
                     struct_fns.push(quote! {
                         #[inline]
-                        #[doc = #desc]
+                        #(#[doc = #doc])*
                         pub fn #setter(&self, t: #ty) {
                             let mut d = self.get_raw();
                             d &= !(#mask << #lsb);
@@ -588,9 +598,10 @@ pub fn build_peripheral(
                     });
                 }
                 if sw_access.is_read() {
+                    let doc = desc.into_iter();
                     struct_fns.push(quote! {
                         #[inline]
-                        #[doc = #desc]
+                        #(#[doc = #doc])*
                         pub fn #getter(&self) -> #ty {
                             let d = self.get_raw();
                             ((d >> #lsb) & #mask) as #ty

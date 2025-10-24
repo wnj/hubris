@@ -52,17 +52,17 @@ enum Trace {
     Programmed,
 
     Startup {
-        early_power_rdbks: fmc_periph::EarlyPowerRdbksView,
+        early_power_rdbks: fmc_sequencer::EarlyPowerRdbksView,
     },
     RegStateValues {
-        seq_api_status: fmc_periph::SeqApiStatusView,
-        seq_raw_status: fmc_periph::SeqRawStatusView,
-        nic_api_status: fmc_periph::NicApiStatusView,
-        nic_raw_status: fmc_periph::NicRawStatusView,
+        seq_api_status: fmc_sequencer::SeqApiStatusView,
+        seq_raw_status: fmc_sequencer::SeqRawStatusView,
+        nic_api_status: fmc_sequencer::NicApiStatusView,
+        nic_raw_status: fmc_sequencer::NicRawStatusView,
     },
     RegPgValues {
-        rail_pgs: fmc_periph::RailPgsView,
-        rail_pgs_max_hold: fmc_periph::RailPgsMaxHoldView,
+        rail_pgs: fmc_sequencer::RailPgsView,
+        rail_pgs_max_hold: fmc_sequencer::RailPgsMaxHoldView,
     },
     SetState {
         prev: Option<PowerState>,
@@ -73,12 +73,12 @@ enum Trace {
     },
     UnexpectedPowerOff {
         our_state: PowerState,
-        seq_state: Result<fmc_periph::A0Sm, u8>,
+        seq_state: Result<fmc_sequencer::A0Sm, u8>,
     },
     SequencerInterrupt {
         our_state: PowerState,
-        seq_state: Result<fmc_periph::A0Sm, u8>,
-        ifr: fmc_periph::IfrView,
+        seq_state: Result<fmc_sequencer::A0Sm, u8>,
+        ifr: fmc_sequencer::IfrView,
     },
     PowerDownError(drv_cpu_seq_api::SeqError),
     Coretype {
@@ -101,6 +101,7 @@ enum Trace {
         now: u64,
     },
     UnexpectedInterrupt,
+    CPUPresent(bool),
 }
 counted_ringbuf!(Trace, 128, Trace::None);
 
@@ -155,8 +156,8 @@ use gpio_irq_pins::SEQ_IRQ;
 
 /// Helper type which includes both sequencer and NIC state machine states
 struct StateMachineStates {
-    seq: Result<fmc_periph::A0Sm, u8>,
-    nic: Result<fmc_periph::NicSm, u8>,
+    seq: Result<fmc_sequencer::A0Sm, u8>,
+    nic: Result<fmc_sequencer::NicSm, u8>,
 }
 
 #[export_name = "main"]
@@ -260,7 +261,7 @@ fn init(packrat: Packrat) -> Result<ServerImpl, SeqError> {
 
     // Set up the checksum registers for the Spartan7 FPGA
     let token = loader.get_token();
-    let info = fmc_periph::Info::new(token);
+    let info = fmc_periph::info::Info::new(token);
     let short_checksum = gen::SPARTAN7_FPGA_BITSTREAM_CHECKSUM[..4]
         .try_into()
         .unwrap();
@@ -298,8 +299,7 @@ fn init(packrat: Packrat) -> Result<ServerImpl, SeqError> {
     // Turn on the chassis LED!
     sys.gpio_set(SP_CHASSIS_STATUS_LED);
 
-    let token = loader.get_token();
-    Ok(ServerImpl::new(token, packrat))
+    Ok(ServerImpl::new(loader, packrat))
 }
 
 /// Configures the front FPGA pins and holds it in reset
@@ -376,7 +376,8 @@ struct ServerImpl {
     jefe: Jefe,
     sys: Sys,
     hf: HostFlash,
-    seq: fmc_periph::Sequencer,
+    seq: fmc_sequencer::Sequencer,
+    espi: fmc_periph::espi::Espi,
     vcore: VCore,
     /// Static buffer for encoding ereports. This is a static so that we don't
     /// have it on the stack when encoding ereports.
@@ -387,11 +388,14 @@ const EREPORT_BUF_LEN: usize = 256;
 
 impl ServerImpl {
     fn new(
-        token: drv_spartan7_loader_api::Spartan7Token,
+        loader: drv_spartan7_loader_api::Spartan7Loader,
         packrat: Packrat,
     ) -> Self {
         let now = sys_get_timer().now;
-        let seq = fmc_periph::Sequencer::new(token);
+
+        let seq = fmc_sequencer::Sequencer::new(loader.get_token());
+        let espi = fmc_periph::espi::Espi::new(loader.get_token());
+
         ringbuf_entry!(Trace::Startup {
             early_power_rdbks: (&seq.early_power_rdbks).into(),
         });
@@ -417,6 +421,7 @@ impl ServerImpl {
             sys: Sys::from(SYS.get_task_id()),
             hf: HostFlash::from(HF.get_task_id()),
             seq,
+            espi,
             vcore: VCore::new(I2C.get_task_id(), packrat),
             ereport_buf,
         }
@@ -464,7 +469,7 @@ impl ServerImpl {
             now,
         });
 
-        use fmc_periph::A0Sm;
+        use fmc_sequencer::A0Sm;
         match (self.get_state_impl(), state) {
             (PowerState::A2, PowerState::A0) => {
                 // Reset edge counters in the sequencer
@@ -482,6 +487,7 @@ impl ServerImpl {
 
                 // Wait 2 seconds for power-up
                 let mut okay = false;
+                let mut err = CpuSeqError::A0Timeout;
                 for _ in 0..200 {
                     let state = self.log_state_registers();
                     match state.seq {
@@ -493,9 +499,21 @@ impl ServerImpl {
                             break;
                         }
                         Ok(A0Sm::EnableGrpA) => {
-                            // We have an outstanding issue on v1 hardware-cosmo#658
-                            // that prevents us from checking `CPU_PRESENT` at
-                            // `A0Sm::ENABLE_GRP_A` time
+                            // hardware-cosmo#658 prevents us from checking `CPU_PRESENT`
+                            // at `A0Sm::ENABLE_GRP_A` time on rev-a boards
+                            if cfg!(target_board = "cosmo-a") {
+                                ringbuf_entry!(Trace::CPUPresent(true));
+                            } else {
+                                let present =
+                                    self.sys.gpio_read(SP5_TO_SP_PRESENT_L)
+                                        == 0;
+                                ringbuf_entry!(Trace::CPUPresent(present));
+
+                                if !present {
+                                    err = CpuSeqError::CPUNotPresent;
+                                    break;
+                                }
+                            }
                         }
                         _ => (),
                     }
@@ -509,9 +527,7 @@ impl ServerImpl {
                     self.log_pg_registers();
                     self.seq.power_ctrl.modify(|m| m.set_a0_en(false));
 
-                    // XXX faulted isn't strictly a timeout, but this is the
-                    // closest available error code
-                    return Err(CpuSeqError::A0Timeout);
+                    return Err(err);
                 }
 
                 let coretype0 = self.sys.gpio_read(SP5_TO_SP_CORETYPE0) != 0;
@@ -595,6 +611,16 @@ impl ServerImpl {
 
             // This is purely an accounting change
             (PowerState::A0, PowerState::A0PlusHP) => (),
+            // A0PlusHP is a substate of A0; if we are in A0PlusHP and we are
+            // asked to go to A0, return `Unchanged`, because `A0PlusHP` means
+            // we are already in A0.
+            // Similarly, A2PlusFans "counts as" A2 for the purpose of
+            // externally-requested transitions.
+            (PowerState::A0PlusHP, PowerState::A0)
+            | (PowerState::A2PlusFans, PowerState::A2) => {
+                return Ok(Transition::Unchanged)
+            }
+            // If we are already in the requested state, return `Unchanged`.
             (current, requested) if current == requested => {
                 return Ok(Transition::Unchanged)
             }
@@ -881,6 +907,31 @@ impl idl::InOrderSequencerImpl for ServerImpl {
             idol_runtime::ClientError::BadMessageContents,
         ))
     }
+
+    fn last_post_code(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Ok(self.espi.last_post_code.payload())
+    }
+
+    fn gpio_edge_count(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
+
+    fn gpio_cycle_count(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
 }
 
 impl NotificationHandler for ServerImpl {
@@ -897,7 +948,7 @@ impl NotificationHandler for ServerImpl {
             return;
         }
         let state = self.log_state_registers();
-        use fmc_periph::{A0Sm, NicSm};
+        use fmc_sequencer::{A0Sm, NicSm};
 
         // Detect when the NIC comes online
         // TODO: should we handle the NIC powering down while the main CPU
@@ -940,8 +991,9 @@ mod gen {
 }
 
 mod fmc_periph {
-    include!(concat!(env!("OUT_DIR"), "/fmc_sequencer.rs"));
+    include!(concat!(env!("OUT_DIR"), "/fmc_periph.rs"));
 }
+use fmc_periph::sequencer as fmc_sequencer;
 
 include!(concat!(env!("OUT_DIR"), "/notifications.rs"));
 include!(concat!(env!("OUT_DIR"), "/gpio_irq_pins.rs"));

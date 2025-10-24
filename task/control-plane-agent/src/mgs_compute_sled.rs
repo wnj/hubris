@@ -16,12 +16,13 @@ use gateway_messages::sp_impl::{
 };
 use gateway_messages::{
     ignition, ComponentAction, ComponentActionResponse, ComponentDetails,
-    ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask, Header,
-    IgnitionCommand, IgnitionState, Message, MessageKind, MgsError, MgsRequest,
-    MgsResponse, PowerState, PowerStateTransition, RotBootInfo, RotRequest,
-    RotResponse, SensorRequest, SensorResponse, SpComponent, SpError,
-    SpPort as GwSpPort, SpRequest, SpStateV2, SpUpdatePrepare, UpdateChunk,
-    UpdateId, UpdateStatus, SERIAL_CONSOLE_IDLE_TIMEOUT,
+    ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask,
+    GpioToggleCount, Header, IgnitionCommand, IgnitionState, LastPostCode,
+    Message, MessageKind, MgsError, MgsRequest, MgsResponse, PowerState,
+    PowerStateTransition, RotBootInfo, RotRequest, RotResponse, SensorRequest,
+    SensorResponse, SpComponent, SpError, SpPort as GwSpPort, SpRequest,
+    SpStateV2, SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
+    SERIAL_CONSOLE_IDLE_TIMEOUT,
 };
 use heapless::{Deque, Vec};
 use host_sp_messages::HostStartupOptions;
@@ -29,7 +30,7 @@ use idol_runtime::{Leased, RequestError};
 use ringbuf::ringbuf_entry_root;
 use static_cell::ClaimOnceCell;
 use task_control_plane_agent_api::{
-    ControlPlaneAgentError, UartClient, VpdIdentity,
+    ControlPlaneAgentError, OxideIdentity, UartClient,
     MAX_INSTALLINATOR_IMAGE_ID_LEN,
 };
 use task_net_api::{Address, MacAddress, UdpMetadata, VLanId};
@@ -170,7 +171,7 @@ impl MgsHandler {
         }
     }
 
-    pub(crate) fn identity(&self) -> VpdIdentity {
+    pub(crate) fn identity(&self) -> OxideIdentity {
         self.common.identity()
     }
 
@@ -914,7 +915,34 @@ impl SpHandler for MgsHandler {
         component: SpComponent,
         index: BoundsChecked,
     ) -> ComponentDetails {
-        self.common.inventory().component_details(&component, index)
+        self.common.inventory().component_details(
+            &component,
+            index,
+            |dev, index| {
+                match dev.component {
+                    SpComponent::SP5_HOST_CPU => {
+                        // Only one component detail for now
+                        assert_eq!(index.0, 0);
+                        ComponentDetails::LastPostCode(LastPostCode(
+                            self.sequencer.last_post_code(),
+                        ))
+                    }
+                    SpComponent::SP3_HOST_CPU => {
+                        // Only one component detail for now
+                        assert_eq!(index.0, 0);
+                        ComponentDetails::GpioToggleCount(GpioToggleCount {
+                            edge_count: self.sequencer.gpio_edge_count(),
+                            cycles_since_last_edge: self
+                                .sequencer
+                                .gpio_cycle_count(),
+                        })
+                    }
+                    _ => {
+                        panic!("no other devices have component details");
+                    }
+                }
+            },
+        )
     }
 
     fn component_get_active_slot(

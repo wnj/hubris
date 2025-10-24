@@ -28,7 +28,7 @@ use gateway_messages::{
 use host_sp_messages::HostStartupOptions;
 use idol_runtime::{Leased, RequestError};
 use ringbuf::{counted_ringbuf, ringbuf_entry, ringbuf_entry_root};
-use task_control_plane_agent_api::{ControlPlaneAgentError, VpdIdentity};
+use task_control_plane_agent_api::{ControlPlaneAgentError, OxideIdentity};
 use task_net_api::{MacAddress, UdpMetadata, VLanId};
 use userlib::sys_get_timer;
 use zerocopy::IntoBytes;
@@ -161,7 +161,7 @@ impl MgsHandler {
         }
     }
 
-    pub(crate) fn identity(&self) -> VpdIdentity {
+    pub(crate) fn identity(&self) -> OxideIdentity {
         self.common.identity()
     }
 
@@ -928,7 +928,13 @@ impl SpHandler for MgsHandler {
             SpComponent::MONORAIL => ComponentDetails::PortStatus(
                 monorail_port_status::port_status(&self.monorail, index),
             ),
-            _ => self.common.inventory().component_details(&component, index),
+            _ => self.common.inventory().component_details(
+                &component,
+                index,
+                // This should never be called, because num_component_details
+                // never returns > 0 for devices in the OUR_DEVICES array
+                |_, _| panic!("no custom devices"),
+            ),
         }
     }
 
@@ -1219,13 +1225,13 @@ fn get_ecdsa_challenge() -> Result<EcdsaSha2Nistp256Challenge, SpError> {
     let packrat = task_packrat_api::Packrat::from(
         crate::mgs_common::PACKRAT.get_task_id(),
     );
-    let identity = packrat.get_identity().unwrap_or(VpdIdentity::default());
+    let identity = packrat.get_identity().unwrap_or(OxideIdentity::default());
     const HW_ID_LEN: usize = 32;
     let mut hw_id = [0u8; HW_ID_LEN];
     static_assertions::const_assert!(
-        HW_ID_LEN >= core::mem::size_of::<VpdIdentity>()
+        HW_ID_LEN >= core::mem::size_of::<OxideIdentity>()
     );
-    hw_id[..core::mem::size_of::<VpdIdentity>()]
+    hw_id[..core::mem::size_of::<OxideIdentity>()]
         .copy_from_slice(identity.as_bytes());
 
     let now = sys_get_timer().now;

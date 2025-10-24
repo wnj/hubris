@@ -16,6 +16,7 @@ use userlib::{
     hl, set_timer_relative, sys_get_timer, sys_recv_notification,
     sys_set_timer, task_slot, units, RecvMessage, TaskId, UnwrapLite,
 };
+use zerocopy::IntoBytes;
 
 use drv_cpu_seq_api::{PowerState, SeqError, StateChangeReason, Transition};
 use drv_hf_api as hf_api;
@@ -966,6 +967,20 @@ impl<S: SpiServer> ServerImpl<S> {
 
                 Ok(Transition::Changed)
             }
+            //
+            // A0PlusHP is a substate of A0; if we are in A0PlusHP and we are
+            // asked to go to A0, return `Unchanged`, because `A0PlusHP` means
+            // we are already in A0.
+            // Similarly, A2PlusFans "counts as" A2 for the purpose of
+            // externally-requested transitions.
+            //
+            (PowerState::A0PlusHP, PowerState::A0)
+            | (PowerState::A2PlusFans, PowerState::A2) => {
+                Ok(Transition::Unchanged)
+            }
+            //
+            // If we are already in the requested state, return `Unchanged`.
+            //
             (current, requested) if current == requested => {
                 Ok(Transition::Unchanged)
             }
@@ -1134,6 +1149,37 @@ impl<S: SpiServer> idl::InOrderSequencerImpl for ServerImpl<S> {
         }
 
         Ok(buf)
+    }
+
+    fn last_post_code(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
+
+    fn gpio_edge_count(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        let mut out = zerocopy::byteorder::big_endian::U32::new(0);
+        self.seq
+            .read_bytes(Addr::GPIO_EDGE_CNT_3, out.as_mut_bytes())
+            .unwrap_lite();
+        Ok(out.get())
+    }
+
+    fn gpio_cycle_count(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        let mut out = zerocopy::byteorder::big_endian::U32::new(0);
+        self.seq
+            .read_bytes(Addr::GPIO_CYCLE_CNT_3, out.as_mut_bytes())
+            .unwrap_lite();
+        Ok(out.get())
     }
 }
 
