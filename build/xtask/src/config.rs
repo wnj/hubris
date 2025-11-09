@@ -133,7 +133,7 @@ impl Config {
         }
 
         for (name, size) in &toml.kernel.requires {
-            if (size % 4) != 0 {
+            if !size.is_multiple_of(4) {
                 bail!("kernel region '{name}' not a multiple of 4: {size}");
             }
         }
@@ -177,23 +177,40 @@ impl Config {
             let Node::Addrmap { children, .. } = root else {
                 bail!("top-level node is not addrmap");
             };
-            for (i, p) in children.iter().enumerate() {
+            for p in children.iter() {
                 let Node::Addrmap {
                     inst_name,
                     addr_offset,
+                    addr_span_bytes,
                     ..
                 } = &p
                 else {
                     bail!("second-level node must be Addrmap");
                 };
-                if *addr_offset != i * 256 {
-                    bail!("mmio peripherals must be spaced at 256 bytes");
+                let address = *addr_offset as u32 + base_address;
+                let size: u32 = addr_span_bytes
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "mmio peripheral {inst_name} must \
+                             include `addr_span_bytes`"
+                        )
+                    })?
+                    .next_power_of_two()
+                    .try_into()
+                    .unwrap();
+                let size = size.max(32); // min MPU size for STM32H7
+                if !address.is_multiple_of(size) {
+                    bail!(
+                        "address of mmio peripheral `{inst_name}` \
+                         ({address:#x}) is not a multiple of its size \
+                         ({size:#x})"
+                    );
                 }
                 peripherals.insert(
                     format!("mmio_{inst_name}"),
                     Peripheral {
-                        address: *addr_offset as u32 + base_address,
-                        size: 256,
+                        address,
+                        size,
                         interrupts: BTreeMap::new(),
                     },
                 );
@@ -280,9 +297,9 @@ impl Config {
             })
             .collect();
         scored.sort();
-        let mut out = format!("'{}' is not a valid task name.", name);
+        let mut out = format!("'{name}' is not a valid task name.");
         if let Some((_, s)) = scored.first() {
-            out.push_str(&format!(" Did you mean '{}'?", s));
+            out.push_str(&format!(" Did you mean '{s}'?"));
         }
         out
     }
@@ -340,8 +357,8 @@ impl Config {
             );
             for (name, checksum) in aux.checksums.iter() {
                 env.insert(
-                    format!("HUBRIS_AUXFLASH_CHECKSUM_{}", name),
-                    format!("{:?}", checksum),
+                    format!("HUBRIS_AUXFLASH_CHECKSUM_{name}"),
+                    format!("{checksum:?}"),
                 );
             }
         }
@@ -535,7 +552,7 @@ impl Config {
             "thumbv7em-none-eabihf" | "thumbv6m-none-eabi" => {
                 MpuAlignment::PowerOfTwo
             }
-            t => panic!("Unknown mpu requirements for target '{}'", t),
+            t => panic!("Unknown mpu requirements for target '{t}'"),
         }
     }
 
@@ -558,7 +575,7 @@ impl Config {
         match name {
             "kernel" => {
                 // Nearest chunk of 16
-                [((size + 15) / 16) * 16].into_iter().collect()
+                [size.next_multiple_of(16)].into_iter().collect()
             }
             _ => self
                 .mpu_alignment()
@@ -598,7 +615,7 @@ impl Config {
 
     fn get_extern_regions(
         &self,
-        extern_regions: &Vec<String>,
+        extern_regions: &[String],
         image_name: &str,
     ) -> Result<IndexMap<String, Range<u32>>> {
         extern_regions
@@ -695,7 +712,7 @@ impl MpuAlignment {
                 out
             }
             MpuAlignment::Chunk(c) => {
-                [((size + c - 1) / c) * c].into_iter().collect()
+                [size.next_multiple_of(*c)].into_iter().collect()
             }
         }
     }
