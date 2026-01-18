@@ -2,7 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use core::fmt::{self, Write};
 use gateway_messages::measurement::{
     Measurement, MeasurementError, MeasurementKind,
 };
@@ -43,27 +42,41 @@ impl Inventory {
         component: &SpComponent,
     ) -> Result<u32, SpError> {
         match Index::try_from(component)? {
-            Index::OurDevice(_) => Ok(0),
+            Index::OurDevice(d) => {
+                match OUR_DEVICES[d].component {
+                    // The SP5 CPU can report a POST code and GPIO cycle count
+                    SpComponent::SP5_HOST_CPU => Ok(2),
+                    // The SP3 CPU can report GPIO toggle counts
+                    SpComponent::SP3_HOST_CPU => Ok(1),
+                    _ => Ok(0),
+                }
+            }
             Index::ValidateDevice(i) => {
                 Ok(VALIDATE_DEVICES[i].sensors.len() as u32)
             }
         }
     }
 
-    pub(crate) fn component_details(
+    pub(crate) fn component_details<F>(
         &self,
         component: &SpComponent,
         component_index: BoundsChecked,
-    ) -> ComponentDetails {
+        our_device_lookup: F,
+    ) -> ComponentDetails
+    where
+        F: Fn(&DeviceDescription<'static>, BoundsChecked) -> ComponentDetails,
+    {
         // `component_index` is guaranteed to be in the range
-        // `0..num_component_details(component)`, and we only return a value
-        // greater than 0 from that method for indices in the VALIDATE_DEVICES
-        // range. We'll map the component back to an index back here and panic
-        // for the unreachable branches (an out of range index or an index in
-        // the `OurDevice(_)` subrange).
+        // `0..num_component_details(component)`. We'll map the component back
+        // to an index back here, panicking for an out-of-range index; the
+        // `our_device_lookup` closure is also expected to panic if given an
+        // out-of-range index
         let val_device_index = match Index::try_from(component) {
             Ok(Index::ValidateDevice(i)) => i,
-            Ok(Index::OurDevice(_)) | Err(_) => panic!(),
+            Ok(Index::OurDevice(i)) => {
+                return our_device_lookup(&OUR_DEVICES[i], component_index)
+            }
+            Err(_) => panic!(),
         };
 
         let sensor_description = &VALIDATE_DEVICES[val_device_index].sensors
@@ -111,24 +124,12 @@ impl Inventory {
             }
         };
 
-        // This format string is statically guaranteed to fit in `component`
-        // based on our `max_num_devices` submodule below (which only contains
-        // static assertions that ensure this format string will fit!).
-        let mut component = FmtComponentId::default();
-        write!(
-            &mut component,
-            "{}{}",
-            SpComponent::GENERIC_DEVICE_PREFIX,
-            index
-        )
-        .unwrap_lite();
-
         let mut capabilities = DeviceCapabilities::empty();
         if !device.sensors.is_empty() {
             capabilities |= DeviceCapabilities::HAS_MEASUREMENT_CHANNELS;
         }
         DeviceDescription {
-            component: SpComponent { id: component.id },
+            component: SpComponent { id: device.id },
             device: device.device,
             description: device.description,
             capabilities,
@@ -176,52 +177,20 @@ impl TryFrom<&'_ SpComponent> for Index {
     type Error = SpError;
 
     fn try_from(component: &'_ SpComponent) -> Result<Self, Self::Error> {
-        if component
-            .id
-            .starts_with(SpComponent::GENERIC_DEVICE_PREFIX.as_bytes())
+        if let Ok(entry_idx) = task_validate_api::DEVICE_INDICES_BY_SORTED_ID
+            .binary_search_by_key(&component.id, |&(id, _)| id)
         {
-            // We know `component` starts with `GENERIC_DEVICE_PREFIX`, so
-            // it's safe to slice into the string at that index.
-            let id = component
-                .as_str()
-                .ok_or(SpError::RequestUnsupportedForComponent)?;
-            let suffix = &id[SpComponent::GENERIC_DEVICE_PREFIX.len()..];
-
-            let index = suffix
-                .parse::<usize>()
-                .map_err(|_| SpError::RequestUnsupportedForComponent)?;
-            if index < VALIDATE_DEVICES.len() {
-                Ok(Self::ValidateDevice(index))
-            } else {
-                Err(SpError::RequestUnsupportedForComponent)
-            }
-        } else {
-            for (i, d) in OUR_DEVICES.iter().enumerate() {
-                if *component == d.component {
-                    return Ok(Self::OurDevice(i));
-                }
-            }
-            Err(SpError::RequestUnsupportedForComponent)
+            let &(_, index) = task_validate_api::DEVICE_INDICES_BY_SORTED_ID
+                .get(entry_idx)
+                .unwrap_lite();
+            return Ok(Self::ValidateDevice(index));
         }
-    }
-}
-
-#[derive(Default)]
-struct FmtComponentId {
-    pos: usize,
-    id: [u8; SpComponent::MAX_ID_LENGTH],
-}
-
-impl fmt::Write for FmtComponentId {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        let remaining = &mut self.id[self.pos..];
-        if s.len() <= remaining.len() {
-            remaining[..s.len()].copy_from_slice(s.as_bytes());
-            self.pos += s.len();
-            Ok(())
-        } else {
-            Err(fmt::Error)
+        for (i, d) in OUR_DEVICES.iter().enumerate() {
+            if *component == d.component {
+                return Ok(Self::OurDevice(i));
+            }
         }
+        Err(SpError::RequestUnsupportedForComponent)
     }
 }
 
@@ -330,38 +299,18 @@ mod devices_with_static_validation {
             // The LED is soldered to the board
             presence: DevicePresence::Present,
         },
+        #[cfg(feature = "sidecar")]
+        DeviceDescription {
+            component: SpComponent::TOFINO,
+            device: SpComponent::TOFINO.const_as_str(),
+            description: "Tofino",
+            capabilities: DeviceCapabilities::empty(),
+            presence: DevicePresence::Present,
+        },
     ];
 
     pub(super) static OUR_DEVICES: &[DeviceDescription<'static>] =
         OUR_DEVICES_CONST;
-
-    // We use a generic component ID of `{prefix}{index}` for all of
-    // `VALIDATE_DEVICES`; here we statically assert the maximum number of
-    // devices we can use with this scheme. At the time of writing this comment,
-    // our ID width is 16 bytes and the prefix is 4 bytes, allowing up to
-    // 999_999_999_999 devices to be listed.
-
-    // How many bytes are available for digits of a device index in base 10?
-    const DIGITS_AVAILABLE: usize =
-        SpComponent::MAX_ID_LENGTH - SpComponent::GENERIC_DEVICE_PREFIX.len();
-
-    // How many devices can we list given `DIGITS_AVAILABLE`?
-    const MAX_NUM_DEVICES: u64 = const_exp10(DIGITS_AVAILABLE);
-
-    // Statically assert that we have at most that many devices.
-    static_assertions::const_assert!(
-        VALIDATE_DEVICES_CONST.len() as u64 <= MAX_NUM_DEVICES
-    );
-
-    // Helper function: computes 10^n at compile time.
-    const fn const_exp10(mut n: usize) -> u64 {
-        let mut x = 1;
-        while n > 0 {
-            x *= 10;
-            n -= 1;
-        }
-        x
-    }
 
     // We will spread the contents of `DEVICES` out over multiple packets to
     // MGS; however, we do _not_ currently handle the case where a single

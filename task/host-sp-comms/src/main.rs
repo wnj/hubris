@@ -12,7 +12,9 @@ use attest_data::messages::{
     HostToRotCommand, RecvSprotError as AttestDataSprotError, RotToHost,
     MAX_DATA_LEN,
 };
-use drv_cpu_seq_api::{PowerState, SeqError, Sequencer, StateChangeReason};
+use drv_cpu_seq_api::{
+    PowerState, SeqError, Sequencer, StateChangeReason, Transition,
+};
 use drv_hf_api::{HfDevSelect, HfMuxState, HostFlash};
 use drv_sprot_api::SpRot;
 use drv_stm32xx_sys_api as sys_api;
@@ -37,7 +39,7 @@ use task_host_sp_comms_api::HostSpCommsError;
 use task_net_api::Net;
 use task_packrat_api::Packrat;
 use userlib::{
-    hl, sys_get_timer, sys_irq_control, task_slot, FromPrimitive, UnwrapLite,
+    sys_get_timer, sys_irq_control, task_slot, FromPrimitive, UnwrapLite,
 };
 
 mod inventory;
@@ -55,18 +57,24 @@ use inventory::INVENTORY_API_VERSION;
 )]
 #[cfg_attr(target_board = "gimletlet-2", path = "bsp/gimletlet.rs")]
 #[cfg_attr(target_board = "grapefruit", path = "bsp/grapefruit.rs")]
+#[cfg_attr(
+    any(target_board = "cosmo-a", target_board = "cosmo-b",),
+    path = "bsp/cosmo_ab.rs"
+)]
 mod bsp;
+
+use bsp::SP_TO_HOST_CPU_INT_L;
 
 mod tx_buf;
 use tx_buf::TxBuf;
 
 task_slot!(CONTROL_PLANE_AGENT, control_plane_agent);
 task_slot!(CPU_SEQ, cpu_seq);
-task_slot!(HOST_FLASH, hf);
 task_slot!(PACKRAT, packrat);
 task_slot!(NET, net);
 task_slot!(SYS, sys);
 task_slot!(SPROT, sprot);
+task_slot!(pub HOST_FLASH, hf);
 
 // TODO: When rebooting the host, we need to wait for the relevant power rails
 // to decay. We ought to do this properly by monitoring the rails, but for now,
@@ -108,6 +116,12 @@ enum Trace {
         state: PowerState,
         why: StateChangeReason,
     },
+    AlreadyInState {
+        now: u64,
+        #[count(children)]
+        state: PowerState,
+        why: StateChangeReason,
+    },
     HfMux {
         now: u64,
         state: Option<HfMuxState>,
@@ -133,6 +147,16 @@ enum Trace {
         sequence: u64,
         #[count(children)]
         message: SpToHost,
+    },
+    ApobWriteError {
+        offset: u32,
+        #[count(children)]
+        err: drv_hf_api::ApobWriteError,
+    },
+    ApobReadError {
+        offset: u32,
+        #[count(children)]
+        err: drv_hf_api::ApobReadError,
     },
 }
 
@@ -251,6 +275,21 @@ struct ServerImpl {
     reboot_state: Option<RebootState>,
     host_kv_storage: HostKeyValueStorage,
     hf_mux_state: Option<HfMuxState>,
+
+    /// Temporary space for inventory data, which is a large `enum`
+    scratch: &'static mut host_sp_messages::InventoryData,
+
+    /// Scratch buffer for reading barcodes out of EEPROMs.
+    ///
+    /// MPN1 barcodes can be up to 128 bytes long, so this is better kept off
+    /// the stack.
+    // This is not used on dev board targets.
+    #[cfg(not(any(
+        target_board = "grapefruit",
+        target_board = "gimletlet-2"
+    )))]
+    barcode_buf: &'static mut [u8; oxide_barcode::VpdIdentity::MAX_LEN],
+
     /// Set when the host OS fails to boot or panics, and unset when the system
     /// reboots.
     ///
@@ -279,6 +318,12 @@ impl ServerImpl {
             last_panic: [u8; MAX_HOST_FAIL_MESSAGE_LEN],
             etc_system: [u8; MAX_ETC_SYSTEM_LEN],
             dtrace_conf: [u8; MAX_DTRACE_CONF_LEN],
+            scratch: host_sp_messages::InventoryData,
+            #[cfg(not(any(
+                target_board = "grapefruit",
+                target_board = "gimletlet-2"
+            )))]
+            barcode_buf: [u8; oxide_barcode::VpdIdentity::MAX_LEN],
         }
         let Bufs {
             ref mut tx_buf,
@@ -287,6 +332,12 @@ impl ServerImpl {
             ref mut last_panic,
             ref mut etc_system,
             ref mut dtrace_conf,
+            ref mut scratch,
+            #[cfg(not(any(
+                target_board = "grapefruit",
+                target_board = "gimletlet-2"
+            )))]
+            ref mut barcode_buf,
         } = {
             static BUFS: ClaimOnceCell<Bufs> = ClaimOnceCell::new(Bufs {
                 tx_buf: tx_buf::StaticBufs::new(),
@@ -295,6 +346,17 @@ impl ServerImpl {
                 last_panic: [0; MAX_HOST_FAIL_MESSAGE_LEN],
                 etc_system: [0; MAX_ETC_SYSTEM_LEN],
                 dtrace_conf: [0; MAX_DTRACE_CONF_LEN],
+                #[cfg(not(any(
+                    target_board = "grapefruit",
+                    target_board = "gimletlet-2"
+                )))]
+                barcode_buf: [0; oxide_barcode::VpdIdentity::MAX_LEN],
+
+                // Default value for InventoryData
+                scratch: host_sp_messages::InventoryData::DimmSpd {
+                    id: [0u8; 512],
+                    temp_sensor: 0u32,
+                },
             });
             BUFS.claim()
         };
@@ -304,6 +366,11 @@ impl ServerImpl {
             timers,
             tx_buf: tx_buf::TxBuf::new(tx_buf),
             rx_buf,
+            #[cfg(not(any(
+                target_board = "grapefruit",
+                target_board = "gimletlet-2"
+            )))]
+            barcode_buf,
             status: Status::empty(),
             sequencer: Sequencer::from(CPU_SEQ.get_task_id()),
             hf: HostFlash::from(HOST_FLASH.get_task_id()),
@@ -325,6 +392,7 @@ impl ServerImpl {
             },
             hf_mux_state: None,
             last_power_off: None,
+            scratch,
         }
     }
 
@@ -391,26 +459,40 @@ impl ServerImpl {
             // Attempt to move to A2; given we only call this function in
             // response to a host request, we expect we're currently in A0 and
             // this should work.
-            let err =
-                match self.sequencer.set_state_with_reason(PowerState::A2, why)
-                {
-                    Ok(()) => {
-                        ringbuf_entry!(Trace::SetState {
-                            now: sys_get_timer().now,
-                            why,
-                            state: PowerState::A2,
-                        });
-                        if reboot {
-                            self.reboot_state = Some(RebootState::WaitingForA2);
-                        }
+            match self.sequencer.set_state_with_reason(PowerState::A2, why) {
+                Ok(Transition::Changed) => {
+                    ringbuf_entry!(Trace::SetState {
+                        now: sys_get_timer().now,
+                        why,
+                        state: PowerState::A2,
+                    });
+                    if reboot {
+                        self.reboot_state = Some(RebootState::WaitingForA2);
+                    }
+                    return;
+                }
+                Ok(Transition::Unchanged) => {
+                    // We're already in A2.
+                    ringbuf_entry!(Trace::AlreadyInState {
+                        now: sys_get_timer().now,
+                        why,
+                        state: PowerState::A2,
+                    });
+
+                    // If we're not trying to reboot, we're done.
+                    //
+                    // TODO(eliza): perhaps we ought to  have a way to indicate
+                    // this to up-stack software...
+                    if !reboot {
                         return;
                     }
-                    Err(err) => err,
-                };
-
-            // The only error we should see from `set_state()` is an illegal
-            // transition, if we're not currently in A0.
-            assert!(matches!(err, SeqError::IllegalTransition));
+                }
+                Err(err) => {
+                    // The only error we should see from `set_state()` is an illegal
+                    // transition, if we're not currently in A0.
+                    assert!(matches!(err, SeqError::IllegalTransition));
+                }
+            };
 
             // If we can't go to A2, what state are we in, keeping in mind that
             // we have a bit of TOCTOU here in that the state might've changed
@@ -442,12 +524,6 @@ impl ServerImpl {
                     }
                     return;
                 }
-
-                // A1 should be transitory; sleep then retry.
-                PowerState::A1 => {
-                    hl::sleep_for(1);
-                    continue;
-                }
             }
         }
     }
@@ -472,7 +548,6 @@ impl ServerImpl {
                         Some(RebootState::WaitingInA2RebootDelay);
                 }
             }
-            PowerState::A1 => (), // do nothing
             PowerState::A0Reset => {
                 // We have spontaneously reset.  We are in A0 (and indeed,
                 // by time we get this, the ABL is presumably running), but
@@ -750,6 +825,27 @@ impl ServerImpl {
             self.tx_buf.reset();
         }
 
+        // If we receive an out-of-sequence message, then lock the APOB state
+        // machine.  This makes it harder for malicious hosts to exfiltrate
+        // data via the host flash APOB slots.
+        match request {
+            HostToSp::KeyLookup { .. }
+            | HostToSp::GetBootStorageUnit
+            | HostToSp::GetIdentity
+            | HostToSp::GetStatus
+            | HostToSp::AckSpStart
+            | HostToSp::ApobBegin { .. }
+            | HostToSp::ApobData { .. }
+            | HostToSp::ApobRead { .. }
+            | HostToSp::ApobCommit => {
+                // These are explicitly allowed
+            }
+            _ => {
+                // Anything not allowed is prohibited!
+                self.hf.apob_lock();
+            }
+        }
+
         // We defer any actions until after we've serialized our response to
         // avoid borrow checker issues with calling methods on `self`.
         let mut action = None;
@@ -774,11 +870,6 @@ impl ServerImpl {
                 // flash task? That should only happen if `hf` is unable to
                 // respond to us at all, which makes it seem unlikely that the
                 // host could even be up. We'll default to returning Bsu::A.
-                //
-                // Minor TODO: Attempting to get the BSU on a gimletlet will
-                // hang, because the host-flash task hangs indefinitely. We
-                // could replace gimlet-hf-server with a fake on gimletlet if
-                // that becomes onerous.
                 let bsu = match self.hf.get_dev() {
                     Ok(HfDevSelect::Flash0) | Err(_) => Bsu::A,
                     Ok(HfDevSelect::Flash1) => Bsu::B,
@@ -967,6 +1058,39 @@ impl ServerImpl {
                     }),
                 }
             }
+            HostToSp::ApobBegin { length, algorithm } => {
+                Some(SpToHost::ApobBegin(Self::apob_begin(
+                    &self.hf, length, algorithm, data,
+                )))
+            }
+            HostToSp::ApobCommit => {
+                // Call into `hf` to do the work here
+                use drv_hf_api::ApobCommitError;
+                use host_sp_messages::ApobCommitResult;
+                Some(SpToHost::ApobCommit(match self.hf.apob_commit() {
+                    Ok(()) => ApobCommitResult::Ok,
+                    Err(ApobCommitError::NotImplemented) => {
+                        ApobCommitResult::NotImplemented
+                    }
+                    Err(ApobCommitError::InvalidState) => {
+                        ApobCommitResult::InvalidState
+                    }
+                    Err(ApobCommitError::ValidationFailed) => {
+                        ApobCommitResult::ValidationFailed
+                    }
+                    Err(ApobCommitError::CommitFailed) => {
+                        ApobCommitResult::CommitFailed
+                    }
+                }))
+            }
+            HostToSp::ApobData { offset } => Some(SpToHost::ApobData(
+                Self::apob_write(&self.hf, offset, data),
+            )),
+            HostToSp::ApobRead { offset, size } => {
+                // apob_read does serialization itself
+                self.apob_read(header.sequence, offset, size);
+                None
+            }
         };
 
         if let Some(response) = response {
@@ -993,6 +1117,128 @@ impl ServerImpl {
         self.rx_buf.clear();
 
         Ok(())
+    }
+
+    fn apob_begin(
+        hf: &HostFlash,
+        length: u64,
+        algorithm: u8,
+        data: &[u8],
+    ) -> host_sp_messages::ApobBeginResult {
+        // Decode into internal types, then call into `hf`
+        // XXX should bad hash algorithms or lengths lock the APOB?
+        use drv_hf_api::{ApobBeginError, ApobHash};
+        use host_sp_messages::ApobBeginResult;
+        let Ok(length) = u32::try_from(length) else {
+            return host_sp_messages::ApobBeginResult::BadDataLength;
+        };
+        match algorithm {
+            0 => {
+                if let Ok(d) = data.try_into() {
+                    let hash = ApobHash::Sha256(d);
+                    match hf.apob_begin(length, hash) {
+                        Ok(()) => ApobBeginResult::Ok,
+                        Err(ApobBeginError::NotImplemented) => {
+                            ApobBeginResult::NotImplemented
+                        }
+                        Err(ApobBeginError::InvalidState) => {
+                            ApobBeginResult::InvalidState
+                        }
+                        Err(ApobBeginError::BadDataLength) => {
+                            ApobBeginResult::BadDataLength
+                        }
+                    }
+                } else {
+                    ApobBeginResult::BadHashLength
+                }
+            }
+            _ => ApobBeginResult::InvalidAlgorithm,
+        }
+    }
+
+    /// Write data to the bonus region of flash
+    ///
+    /// This does not take `&self` because we need to force a split borrow
+    fn apob_write(
+        hf: &HostFlash,
+        offset: u64,
+        data: &[u8],
+    ) -> host_sp_messages::ApobDataResult {
+        use drv_hf_api::ApobWriteError;
+        use host_sp_messages::ApobDataResult;
+        let Ok(offset) = u32::try_from(offset) else {
+            return ApobDataResult::InvalidOffset;
+        };
+        match hf.apob_write(offset, data) {
+            Ok(()) => ApobDataResult::Ok,
+            Err(err) => {
+                ringbuf_entry!(Trace::ApobWriteError { offset, err });
+                match err {
+                    ApobWriteError::NotImplemented => {
+                        ApobDataResult::NotImplemented
+                    }
+                    ApobWriteError::InvalidState => {
+                        ApobDataResult::InvalidState
+                    }
+                    ApobWriteError::InvalidOffset => {
+                        ApobDataResult::InvalidOffset
+                    }
+                    ApobWriteError::InvalidSize => ApobDataResult::InvalidSize,
+                    ApobWriteError::WriteFailed => ApobDataResult::WriteFailed,
+                    ApobWriteError::NotErased => ApobDataResult::NotErased,
+                }
+            }
+        }
+    }
+
+    /// Reads and encodes data from the bonus region of flash
+    fn apob_read(&mut self, sequence: u64, offset: u64, size: u64) {
+        use drv_hf_api::ApobReadError;
+        use host_sp_messages::ApobReadResult;
+        let Ok(size) = usize::try_from(size) else {
+            self.tx_buf.encode_response(
+                sequence,
+                &SpToHost::ApobRead(ApobReadResult::InvalidSize),
+                |_buf| 0,
+            );
+            return;
+        };
+        let Ok(offset) = u32::try_from(offset) else {
+            self.tx_buf.encode_response(
+                sequence,
+                &SpToHost::ApobRead(ApobReadResult::InvalidOffset),
+                |_buf| 0,
+            );
+            return;
+        };
+        self.tx_buf.try_encode_response(
+            sequence,
+            &SpToHost::ApobRead(ApobReadResult::Ok),
+            |buf| match self.hf.apob_read(offset, &mut buf[..size]) {
+                Ok(n) => Ok(n),
+                Err(err) => {
+                    ringbuf_entry!(Trace::ApobReadError { offset, err });
+                    Err(SpToHost::ApobRead(match err {
+                        ApobReadError::NotImplemented => {
+                            ApobReadResult::NotImplemented
+                        }
+                        ApobReadError::InvalidState => {
+                            ApobReadResult::InvalidState
+                        }
+                        ApobReadError::NoValidApob => {
+                            ApobReadResult::NoValidApob
+                        }
+                        ApobReadError::InvalidOffset => {
+                            ApobReadResult::InvalidOffset
+                        }
+                        ApobReadError::InvalidSize => {
+                            ApobReadResult::InvalidSize
+                        }
+                        ApobReadError::ReadFailed => ApobReadResult::ReadFailed,
+                    }))
+                }
+            },
+        );
     }
 
     fn handle_sprot(
@@ -1358,17 +1604,18 @@ impl NotificationHandler for ServerImpl {
             | notifications::CONTROL_PLANE_AGENT_MASK
     }
 
-    fn handle_notification(&mut self, bits: u32) {
-        if bits & notifications::USART_IRQ_MASK != 0 {
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.check_notification_mask(notifications::USART_IRQ_MASK) {
             self.handle_usart_notification();
             sys_irq_control(notifications::USART_IRQ_MASK, true);
         }
 
-        if bits & notifications::JEFE_STATE_CHANGE_MASK != 0 {
+        if bits.check_notification_mask(notifications::JEFE_STATE_CHANGE_MASK) {
             self.handle_jefe_notification(self.sequencer.get_state());
         }
 
-        if bits & notifications::CONTROL_PLANE_AGENT_MASK != 0 {
+        if bits.check_notification_mask(notifications::CONTROL_PLANE_AGENT_MASK)
+        {
             self.handle_control_plane_agent_notification();
         }
 
@@ -1377,7 +1624,7 @@ impl NotificationHandler for ServerImpl {
         // We'll record whether or not we want to clear the timer in this
         // variable, then actually clear it (if needed) after the loop over the
         // fired timers.
-        self.timers.handle_notification(bits);
+        self.timers.handle_notification(bits.get_raw_bits());
         let mut tx_timer_disposition = TimerDisposition::LeaveRunning;
         for t in self.timers.iter_fired() {
             match t {
@@ -1452,12 +1699,29 @@ fn handle_reboot_waiting_in_a2_timer(
         // longer in A2. In either case (we successfully started the
         // transition or we're no longer in A2 due to some external cause),
         // we've done what we can to reboot, so clear out `reboot_state`.
-        ringbuf_entry!(Trace::SetState {
-            now: sys_get_timer().now,
-            why,
-            state: PowerState::A0,
-        });
-        _ = sequencer.set_state_with_reason(PowerState::A0, why);
+        match sequencer.set_state_with_reason(PowerState::A0, why) {
+            Ok(Transition::Changed) => {
+                ringbuf_entry!(Trace::SetState {
+                    now: sys_get_timer().now,
+                    why,
+                    state: PowerState::A0,
+                });
+            }
+            Ok(Transition::Unchanged) => {
+                ringbuf_entry!(Trace::AlreadyInState {
+                    now: sys_get_timer().now,
+                    why,
+                    state: PowerState::A0,
+                })
+            }
+            Err(_) => {
+                // Yes, ignore this error. It will have been recorded in the
+                // sequencer client ringbuf, and should not fail unless we are
+                // in A1 already (in which case we will see "illegal
+                // transition", but we are already on our way to A0, so it's
+                // fine).
+            }
+        }
         *reboot_state = None;
     }
 }
@@ -1547,8 +1811,7 @@ fn configure_uart_device(sys: &sys_api::Sys) -> Usart {
     #[cfg(feature = "baud_rate_3M")]
     const BAUD_RATE: u32 = 3_000_000;
 
-    #[cfg(feature = "hardware_flow_control")]
-    let hardware_flow_control = true;
+    let hardware_flow_control = cfg!(feature = "hardware_flow_control");
 
     cfg_if::cfg_if! {
         if #[cfg(feature = "uart7")] {
@@ -1583,6 +1846,22 @@ fn configure_uart_device(sys: &sys_api::Sys) -> Usart {
             let usart = unsafe { &*device::USART6::ptr() };
             let peripheral = Peripheral::Usart6;
             let pins = PINS;
+        } else if #[cfg(feature = "uart8")] {
+            const PINS: &[(PinSet, Alternate)] = {
+                cfg_if::cfg_if! {
+                    if #[cfg(feature = "hardware_flow_control")] {
+                        compile_error!("hardware_flow_control should be disabled");
+                    } else {
+                        &[(
+                            Port::J.pin(8).and_pin(9),
+                            Alternate::AF8
+                        )]
+                    }
+                }
+            };
+            let usart = unsafe { &*device::UART8::ptr() };
+            let peripheral = Peripheral::Uart8;
+            let pins = PINS;
         } else {
             compile_error!("no usartX/uartX feature specified");
         }
@@ -1599,35 +1878,12 @@ fn configure_uart_device(sys: &sys_api::Sys) -> Usart {
     )
 }
 
-cfg_if::cfg_if! {
-    if #[cfg(any(
-        target_board = "gimlet-b",
-        target_board = "gimlet-c",
-        target_board = "gimlet-d",
-        target_board = "gimlet-e",
-        target_board = "gimlet-f",
-    ))] {
-        // This net is named SP_TO_SP3_INT_L in the schematic
-        const SP_TO_HOST_CPU_INT_L: sys_api::PinSet = sys_api::Port::I.pin(7);
-    } else if #[cfg(target_board = "gimletlet-2")] {
-        // gimletlet doesn't have an SP3 to interrupt, but we can wire up an LED
-        // to one of the exposed E2-E6 pins to see it visually.
-        const SP_TO_HOST_CPU_INT_L: sys_api::PinSet = sys_api::Port::E.pin(2);
-    } else if #[cfg(target_board = "grapefruit")] {
-        // the CPU interrupt is not connected on grapefruit, so pick an
-        // unconnected GPIO
-        const SP_TO_HOST_CPU_INT_L: sys_api::PinSet = sys_api::Port::B.pin(1);
-    } else {
-        compile_error!("unsupported target board");
-    }
-}
-
 fn sp_to_sp3_interrupt_enable(sys: &sys_api::Sys) {
     sys.gpio_set(SP_TO_HOST_CPU_INT_L);
 
     sys.gpio_configure_output(
         SP_TO_HOST_CPU_INT_L,
-        sys_api::OutputType::OpenDrain,
+        bsp::SP_TO_HOST_CPU_INT_TYPE,
         sys_api::Speed::Low,
         sys_api::Pull::None,
     );

@@ -16,11 +16,12 @@ use gateway_messages::sp_impl::{
 };
 use gateway_messages::{
     ignition, ComponentAction, ComponentActionResponse, ComponentDetails,
-    ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask, Header,
-    IgnitionCommand, IgnitionState, Message, MessageKind, MgsError, MgsRequest,
-    MgsResponse, PowerState, RotBootInfo, RotRequest, RotResponse,
-    SensorRequest, SensorResponse, SpComponent, SpError, SpPort as GwSpPort,
-    SpRequest, SpStateV2, SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
+    ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask,
+    GpioToggleCount, Header, IgnitionCommand, IgnitionState, LastPostCode,
+    Message, MessageKind, MgsError, MgsRequest, MgsResponse, PowerState,
+    PowerStateTransition, RotBootInfo, RotRequest, RotResponse, SensorRequest,
+    SensorResponse, SpComponent, SpError, SpPort as GwSpPort, SpRequest,
+    SpStateV2, SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
     SERIAL_CONSOLE_IDLE_TIMEOUT,
 };
 use heapless::{Deque, Vec};
@@ -29,7 +30,7 @@ use idol_runtime::{Leased, RequestError};
 use ringbuf::ringbuf_entry_root;
 use static_cell::ClaimOnceCell;
 use task_control_plane_agent_api::{
-    ControlPlaneAgentError, UartClient, VpdIdentity,
+    ControlPlaneAgentError, OxideIdentity, UartClient,
     MAX_INSTALLINATOR_IMAGE_ID_LEN,
 };
 use task_net_api::{Address, MacAddress, UdpMetadata, VLanId};
@@ -170,7 +171,7 @@ impl MgsHandler {
         }
     }
 
-    pub(crate) fn identity(&self) -> VpdIdentity {
+    pub(crate) fn identity(&self) -> OxideIdentity {
         self.common.identity()
     }
 
@@ -446,7 +447,6 @@ impl MgsHandler {
         // what would we map it to? Maybe easier to leave it exposed.
         let state = match self.sequencer.get_state() {
             DrvPowerState::A2 | DrvPowerState::A2PlusFans => PowerState::A2,
-            DrvPowerState::A1 => PowerState::A1,
             DrvPowerState::A0
             | DrvPowerState::A0PlusHP
             | DrvPowerState::A0Thermtrip
@@ -707,8 +707,10 @@ impl SpHandler for MgsHandler {
         &mut self,
         sender: Sender<VLanId>,
         power_state: PowerState,
-    ) -> Result<(), SpError> {
+    ) -> Result<PowerStateTransition, SpError> {
         use drv_cpu_seq_api::PowerState as DrvPowerState;
+        use drv_cpu_seq_api::Transition;
+
         ringbuf_entry_root!(
             CRITICAL,
             CriticalEvent::SetPowerState {
@@ -723,16 +725,27 @@ impl SpHandler for MgsHandler {
 
         let power_state = match power_state {
             PowerState::A0 => DrvPowerState::A0,
-            PowerState::A1 => DrvPowerState::A1,
+            // Nothing should every try to go into A1
+            PowerState::A1 => {
+                return Err(SpError::PowerStateError(
+                    drv_cpu_seq_api::SeqError::IllegalTransition.into(),
+                ))
+            }
             PowerState::A2 => DrvPowerState::A2,
         };
 
-        self.sequencer
+        let transition = self
+            .sequencer
             .set_state_with_reason(
                 power_state,
                 drv_cpu_seq_api::StateChangeReason::ControlPlane,
             )
-            .map_err(|e| SpError::PowerStateError(e as u32))
+            .map_err(|e| SpError::PowerStateError(e as u32))?;
+
+        Ok(match transition {
+            Transition::Changed => PowerStateTransition::Changed,
+            Transition::Unchanged => PowerStateTransition::Unchanged,
+        })
     }
 
     fn serial_console_attach(
@@ -902,7 +915,41 @@ impl SpHandler for MgsHandler {
         component: SpComponent,
         index: BoundsChecked,
     ) -> ComponentDetails {
-        self.common.inventory().component_details(&component, index)
+        self.common.inventory().component_details(
+            &component,
+            index,
+            |dev, index| {
+                match dev.component {
+                    SpComponent::SP5_HOST_CPU => match index.0 {
+                        0 => ComponentDetails::LastPostCode(LastPostCode(
+                            self.sequencer.last_post_code(),
+                        )),
+                        1 => {
+                            ComponentDetails::GpioToggleCount(GpioToggleCount {
+                                edge_count: self.sequencer.gpio_edge_count(),
+                                cycles_since_last_edge: self
+                                    .sequencer
+                                    .gpio_cycle_count(),
+                            })
+                        }
+                        _ => panic!("invalid index"),
+                    },
+                    SpComponent::SP3_HOST_CPU => {
+                        // Only one component detail for now
+                        assert_eq!(index.0, 0);
+                        ComponentDetails::GpioToggleCount(GpioToggleCount {
+                            edge_count: self.sequencer.gpio_edge_count(),
+                            cycles_since_last_edge: self
+                                .sequencer
+                                .gpio_cycle_count(),
+                        })
+                    }
+                    _ => {
+                        panic!("no other devices have component details");
+                    }
+                }
+            },
+        )
     }
 
     fn component_get_active_slot(
@@ -941,6 +988,22 @@ impl SpHandler for MgsHandler {
             _ => self
                 .common
                 .component_set_active_slot(component, slot, persist),
+        }
+    }
+
+    fn component_get_persistent_slot(
+        &mut self,
+        component: SpComponent,
+    ) -> Result<u16, SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::ComponentGetPersistentSlot { component }
+        ));
+
+        match component {
+            SpComponent::HOST_CPU_BOOT_FLASH => {
+                self.host_flash_update.persistent_slot()
+            }
+            _ => self.common.component_get_persistent_slot(component),
         }
     }
 
@@ -1141,6 +1204,32 @@ impl SpHandler for MgsHandler {
         buf: &mut [u8],
     ) -> Result<Option<DumpSegment>, SpError> {
         self.common.task_dump_read_continue(key, seq, buf)
+    }
+
+    fn read_host_flash(
+        &mut self,
+        slot: u16,
+        addr: u32,
+        buf: &mut [u8],
+    ) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::ReadHostFlash {
+            addr
+        }));
+        self.host_flash_update.read_page(slot, addr, buf)
+    }
+
+    fn start_host_flash_hash(&mut self, slot: u16) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::StartHostFlashHash {
+            slot
+        }));
+        self.host_flash_update.start_hash(slot)
+    }
+
+    fn get_host_flash_hash(&mut self, slot: u16) -> Result<[u8; 32], SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetHostFlashHash {
+            slot
+        }));
+        self.host_flash_update.get_hash(slot)
     }
 }
 

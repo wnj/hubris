@@ -43,6 +43,11 @@ enum Trace {
         #[count(children)]
         vid: VLanId,
     },
+    QueueWatchdogFired {
+        #[count(children)]
+        vid: VLanId,
+        socket_index: usize,
+    },
 }
 counted_ringbuf!(Trace, 16, Trace::None);
 
@@ -254,7 +259,7 @@ where
         _msg: &userlib::RecvMessage,
     ) -> Result<ManagementLinkStatus, RequestError<MgmtError>> {
         let (eth, bsp) = self.eth_bsp();
-        let out = bsp.management_link_status(eth).map_err(MgmtError::from)?;
+        let out = bsp.management_link_status(eth)?;
         Ok(out)
     }
 
@@ -264,7 +269,7 @@ where
         _msg: &userlib::RecvMessage,
     ) -> Result<ManagementCounters, RequestError<MgmtError>> {
         let (eth, bsp) = self.eth_bsp();
-        let out = bsp.management_counters(eth).map_err(MgmtError::from)?;
+        let out = bsp.management_counters(eth)?;
         Ok(out)
     }
 
@@ -430,6 +435,10 @@ impl<E: DeviceExt> VLanState<E> {
                 s.close();
                 s.bind(e).unwrap_lite();
                 changed = true;
+                ringbuf_entry!(Trace::QueueWatchdogFired {
+                    vid: self.vid,
+                    socket_index,
+                });
 
                 // Reset the watchdog, so it doesn't fire right away
                 self.queue_watchdog[socket_index] = QueueWatchdog::Nominal;
@@ -572,7 +581,8 @@ where
             spare_macs: MacAddressBlock {
                 base_mac: mac,
                 count: U16::new(
-                    mac_address_block.count.get() - VLanId::LENGTH as u16,
+                    mac_address_block.count.get()
+                        - generated::PORT_COUNT as u16,
                 ),
                 stride: mac_address_block.stride,
             },
@@ -708,7 +718,7 @@ where
                         return Ok(vlan.device.make_meta(
                             endp.port,
                             body_len,
-                            endp.addr.try_into().map_err(|_| ()).unwrap(),
+                            endp.addr.into(),
                         ));
                     }
                     Err(udp::RecvError::Exhausted) => {
@@ -828,9 +838,9 @@ where
         notifications::ETH_IRQ_MASK | notifications::WAKE_TIMER_MASK
     }
 
-    fn handle_notification(&mut self, bits: u32) {
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
         // Interrupt dispatch.
-        if bits & notifications::ETH_IRQ_MASK != 0 {
+        if bits.check_notification_mask(notifications::ETH_IRQ_MASK) {
             self.eth.on_interrupt();
             userlib::sys_irq_control(notifications::ETH_IRQ_MASK, true);
         }

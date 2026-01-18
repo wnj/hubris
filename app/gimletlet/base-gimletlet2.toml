@@ -5,7 +5,6 @@ memory = "memory-large.toml"
 stacksize = 896
 epoch = 0
 version = 0
-fwid = true
 
 [kernel]
 name = "gimletlet"
@@ -14,9 +13,9 @@ requires = {flash = 32768, ram = 8192}
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = {flash = 16384, ram = 2048}
+max-sizes = {flash = 16384, ram = 4096}
 start = true
-stacksize = 1536
+stacksize = 2200
 notifications = ["fault", "timer"]
 
 [tasks.jefe.config.allowed-callers]
@@ -81,8 +80,9 @@ task-slots = ["sys"]
 
 [tasks.hiffy]
 name = "task-hiffy"
+features = ["turbo"]
 priority = 7
-max-sizes = {flash = 32768, ram = 32768}
+max-sizes = {flash = 32768, ram = 65536}
 stacksize = 2048
 start = true
 
@@ -124,13 +124,6 @@ interrupts = {"flash_controller.irq" = "flash-irq"}
 [caboose]
 region = "flash"
 size = 256
-default = true
-
-[tasks.caboose_reader]
-name = "task-caboose-reader"
-priority = 2
-max-sizes = {flash = 16384, ram = 2048}
-start = true
 
 [config]
 [[config.i2c.controllers]]

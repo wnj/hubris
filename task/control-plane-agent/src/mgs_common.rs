@@ -13,7 +13,6 @@ use drv_sprot_api::{
     CabooseOrSprotError,
     Fwid as SpFwid,
     ImageError as SpImageError,
-    ImageVersion as SpImageVersion,
     RotBootInfo as SpRotBootInfo,
     RotBootInfoV2 as SpRotBootInfoV2,
     RotComponent as SpRotComponent,
@@ -40,7 +39,7 @@ use gateway_messages::{
 };
 use ringbuf::ringbuf_entry_root as ringbuf_entry;
 use static_assertions::const_assert;
-use task_control_plane_agent_api::VpdIdentity;
+use task_control_plane_agent_api::OxideIdentity;
 use task_net_api::MacAddress;
 use task_packrat_api::Packrat;
 use task_sensor_api::{Sensor, SensorId};
@@ -101,7 +100,7 @@ impl MgsCommon {
         })
     }
 
-    pub(crate) fn identity(&self) -> VpdIdentity {
+    pub(crate) fn identity(&self) -> OxideIdentity {
         // We don't need to wait for packrat to be loaded: the sequencer task
         // for our board already does, and `net` waits for the sequencer before
         // starting. If we've gotten here, we've received a packet on the
@@ -120,8 +119,8 @@ impl MgsCommon {
         // truncating our values. We'll statically assert that `SpState`'s field
         // length is wider than `VpdIdentity`'s to catch this early.
         const SP_STATE_FIELD_WIDTH: usize = 32;
-        const_assert!(SP_STATE_FIELD_WIDTH >= VpdIdentity::SERIAL_LEN);
-        const_assert!(SP_STATE_FIELD_WIDTH >= VpdIdentity::PART_NUMBER_LEN);
+        const_assert!(SP_STATE_FIELD_WIDTH >= OxideIdentity::SERIAL_LEN);
+        const_assert!(SP_STATE_FIELD_WIDTH >= OxideIdentity::PART_NUMBER_LEN);
 
         ringbuf_entry!(Log::MgsMessage(MgsMessage::SpState));
 
@@ -265,6 +264,24 @@ impl MgsCommon {
         Ok(())
     }
 
+    /// Checks whether `component` matches our prepared reset component
+    ///
+    /// This is **not idempotent**; the prepared reset component is cleared when
+    /// this function is called
+    pub(crate) fn reset_component_trigger_check(
+        &mut self,
+        component: SpComponent,
+    ) -> Result<(), GwSpError> {
+        // If we are not resetting the SP_ITSELF, then we may come back here
+        // to reset something else or to run another prepare/trigger on
+        // the same component, so remove the requested reset.
+        if self.reset_component_requested.take() == Some(component) {
+            Ok(())
+        } else {
+            Err(GwSpError::ResetComponentTriggerWithoutPrepare)
+        }
+    }
+
     /// ResetComponent is used in the context of the management plane
     /// driving a firmware update.
     ///
@@ -280,13 +297,8 @@ impl MgsCommon {
         &mut self,
         component: SpComponent,
     ) -> Result<(), GwSpError> {
-        if self.reset_component_requested != Some(component) {
-            return Err(GwSpError::ResetComponentTriggerWithoutPrepare);
-        }
-        // If we are not resetting the SP_ITSELF, then we may come back here
-        // to reset something else or to run another prepare/trigger on
-        // the same component.
-        self.reset_component_requested = None;
+        // Make sure our staged component is correct
+        self.reset_component_trigger_check(component)?;
 
         // Resetting the SP through reset_component() is
         // the same as through reset() until transient bank selection is
@@ -413,6 +425,31 @@ impl MgsCommon {
                 Ok(())
             }
             // Other components might also be served someday.
+            _ => Err(GwSpError::RequestUnsupportedForComponent),
+        }
+    }
+
+    pub(crate) fn component_get_persistent_slot(
+        &mut self,
+        component: SpComponent,
+    ) -> Result<u16, GwSpError> {
+        match component {
+            SpComponent::SP_ITSELF => {
+                Ok(self.update_sp.get_pending_boot_slot().into())
+            }
+            SpComponent::ROT => {
+                let slot = match self
+                    .sprot
+                    .rot_boot_info()?
+                    .persistent_boot_preference
+                {
+                    SpSlotId::A => 0,
+                    SpSlotId::B => 1,
+                };
+                Ok(slot)
+            }
+            // We know that the LPC55S69 RoT bootloader does not have switchable banks.
+            SpComponent::STAGE0 => Ok(0),
             _ => Err(GwSpError::RequestUnsupportedForComponent),
         }
     }
@@ -599,6 +636,25 @@ impl MgsCommon {
         Ok(())
     }
 
+    /// Returns the `GwRotBootInfo` version requested by MGS, or falls back to
+    /// the highest supported version that does not exceed the request.
+    ///
+    /// This "best-effort" behavior simplifies the client's logic. Later
+    /// response versions are improvements and the control plane benefits from
+    /// the most complete information for update planning. We provide the best
+    /// available data directly rather than forcing the client to handle errors
+    /// and search for a supported version. Callers that require strict
+    /// versioning can treat version mismatches as an error.
+    ///
+    /// The supported versions are constrained by this SP and the RoT firmware.
+    /// Some version skew between the control plane (MGS), SP, and RoT is
+    /// expected.
+    /// Temporary version skew is **unavoidable** during normal system updates
+    /// but can also result from update failures or they can occur during
+    /// development.
+    /// The fallback logic is designed to handle these mismatches gracefully.
+    /// Introducing a new `GwRotBootInfo` variant requires care, as an
+    /// unhandled mismatch can break the update process.
     pub(crate) fn versioned_rot_boot_info(
         &mut self,
         version: u8,
@@ -607,17 +663,66 @@ impl MgsCommon {
             version
         }));
 
-        match self.sprot.versioned_rot_boot_info(version)? {
-            SpVersionedRotBootInfo::V1(v1) => {
-                Ok(GwRotBootInfo::V1(MgsRotState::from(v1).0))
+        // For full context on the version mapping, see the RoT's
+        // `versioned_rot_boot_info` function in `drv/lpc55-update-server`
+        // and the corresponding MGS data structures.
+
+        // Ensure that the version mapping logic below is
+        // intentionally reviewed whenever a new `GwRotBootInfo` version
+        // or SpVersionedRotBootInfo variant is added.
+        // If these assertions fail, both the `match version` mapping and the
+        // `match self.sprot...` response construction must be updated.
+
+        // Force update of this code if new MGS variants are introduced
+        const _HIGHEST_KNOWN_MGS_VERSION: u8 = 3;
+        static_assertions::const_assert_eq!(
+            GwRotBootInfo::HIGHEST_KNOWN_VERSION,
+            _HIGHEST_KNOWN_MGS_VERSION
+        );
+
+        // Force update of this code if new ROT variants are introduced
+        const HIGHEST_KNOWN_ROT_VERSION: u8 = 2;
+        static_assertions::const_assert_eq!(
+            SpVersionedRotBootInfo::HIGHEST_KNOWN_VERSION,
+            HIGHEST_KNOWN_ROT_VERSION
+        );
+
+        // Map the MGS RotBootInfo 1-based versions to RoT 0-based versions.
+        let rot_version = match version {
+            // There is no version -1 in the RoT version number scheme.
+            0 => return Err(GwSpError::RequestUnsupportedForComponent),
+
+            // See Issue #2193: To maintain compatibility with older systems,
+            // we intentionally preserve a legacy bug where MGS V1 was passed
+            // unaltered to the RoT instead of being mapped to RoT V0.
+            // 1 => 0, // This is the correct mapping.
+            1 => 1, // This is the bug-compatible mapping
+
+            // The remaining mappings are consistent with the design.
+            2 => 1,
+            3 => 2,
+            // Clamp the version to the highest known by the SP.
+            _ => HIGHEST_KNOWN_ROT_VERSION,
+        };
+
+        match self.sprot.versioned_rot_boot_info(rot_version)? {
+            SpVersionedRotBootInfo::V1(rot_v1) => {
+                if version == 1 {
+                    // The MGS request is for a deprecated RoT response.
+                    // Maintain bug compatibility until issue #2193 is resolved.
+                    // Construct an MGS V1 from the more recent RoT V1 struct.
+                    Ok(GwRotBootInfo::V1(MgsRotState::from(rot_v1).0))
+                } else {
+                    // The RoT V1 response corresponds to the MGS V2 or is the
+                    // highest that the RoT could provide.
+                    Ok(GwRotBootInfo::V2(MgsRotStateV2::from(rot_v1).0))
+                }
             }
-            SpVersionedRotBootInfo::V2(v2) => match version {
-                2 => Ok(GwRotBootInfo::V2(MgsRotStateV2::from(v2).0)),
-                // RoT's V2 is MGS V3 and the highest version that we can offer today.
-                _ => Ok(GwRotBootInfo::V3(MgsRotStateV3::from(v2).0)),
-            },
-            // New variants that this code doesn't know about yet will
-            // result in a deserialization error.
+            // The RoT V2 response corresponds to the MGS V3 or is the highest
+            // version the RoT could provide.
+            SpVersionedRotBootInfo::V2(rot_v2) => {
+                Ok(GwRotBootInfo::V3(MgsRotStateV3::from(rot_v2).0))
+            }
         }
     }
 
@@ -680,6 +785,7 @@ impl From<SpSlotId> for MgsRotSlotId {
     }
 }
 
+// Note: this struct and impl go away when issue #2193 is resolved.
 struct MgsRotState(GwRotState);
 
 impl From<SpRotBootInfo> for MgsRotState {
@@ -690,21 +796,19 @@ impl From<SpRotBootInfo> for MgsRotState {
                     active: MgsRotSlotId::from(v1.active).0,
                     slot_a: v1.slot_a_sha3_256_digest.map(|digest| {
                         GwRotImageDetails {
-                            version: MgsImageVersion::from(SpImageVersion {
+                            version: GwImageVersion {
                                 version: 0,
                                 epoch: 0,
-                            })
-                            .0,
+                            },
                             digest,
                         }
                     }),
                     slot_b: v1.slot_b_sha3_256_digest.map(|digest| {
                         GwRotImageDetails {
-                            version: MgsImageVersion::from(SpImageVersion {
+                            version: GwImageVersion {
                                 version: 0,
                                 epoch: 0,
-                            })
-                            .0,
+                            },
                             digest,
                         }
                     }),
@@ -764,17 +868,6 @@ impl From<SpRotBootInfoV2> for MgsRotStateV2 {
                 }
                 Err(_) => None,
             },
-        })
-    }
-}
-
-struct MgsImageVersion(GwImageVersion);
-
-impl From<SpImageVersion> for MgsImageVersion {
-    fn from(iv: SpImageVersion) -> Self {
-        MgsImageVersion(GwImageVersion {
-            version: iv.version,
-            epoch: iv.epoch,
         })
     }
 }

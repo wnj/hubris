@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -15,11 +14,9 @@ use std::process::{Command, Stdio};
 use anyhow::{anyhow, bail, Context, Result};
 use atty::Stream;
 use indexmap::IndexMap;
-use lpc55_rom_data::FLASH_PAGE_SIZE as LPC55_FLASH_PAGE_SIZE;
 use multimap::MultiMap;
 use path_slash::{PathBufExt, PathExt};
-use sha3::{Digest, Sha3_256};
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 use crate::{
     caboose_pos,
@@ -42,7 +39,13 @@ pub const DEFAULT_KERNEL_STACK: u32 = 1024;
 /// that generates the Humility binary necessary for Hubris's CI has run.
 /// Once that binary is in place, you should be able to bump this version
 /// without breaking CI.
-const HUBRIS_ARCHIVE_VERSION: u32 = 9;
+///
+/// # Changelog
+/// Version 10 requires Humility to be aware of the `handoff` kernel feature,
+/// which lets the RoT inform the SP when measurements have been taken.  If
+/// Humility is unaware of this feature, the SP will reset itself repeatedly,
+/// which interferes with subsequent programming of auxiliary flash.
+const HUBRIS_ARCHIVE_VERSION: u32 = 10;
 
 /// `PackageConfig` contains a bundle of data that's commonly used when
 /// building a full app image, grouped together to avoid passing a bunch
@@ -191,7 +194,7 @@ impl PackageConfig {
             let cargo_sparse_registry = cargo_home
                 .join("registry")
                 .join("src")
-                .join("index.crates.io-6f17d22bba15001f");
+                .join("index.crates.io-1949cf8c6b5b557f");
             remap_paths.insert(cargo_sparse_registry, "/crates.io");
         }
 
@@ -328,6 +331,7 @@ pub fn package(
     app_toml: &Path,
     tasks_to_build: Option<Vec<String>>,
     dirty_ok: bool,
+    caboose_args: super::CabooseArgs,
 ) -> Result<BTreeMap<String, AllocationMap>> {
     let cfg = PackageConfig::new(app_toml, verbose, edges)?;
 
@@ -425,7 +429,7 @@ pub fn package(
         // Build each task.
         let mut all_output_sections = BTreeMap::default();
 
-        std::fs::create_dir_all(&cfg.img_dir(image_name))?;
+        std::fs::create_dir_all(cfg.img_dir(image_name))?;
         let (allocs, memories) = allocated
             .get(image_name)
             .ok_or_else(|| anyhow!("failed to get image name"))?;
@@ -442,6 +446,18 @@ pub fn package(
                         v.join(", ")
                     );
                 }
+            }
+        }
+        // Same check for the kernel.  This may be overly conservative, because
+        // the kernel is special, but we can always make it less strict later.
+        for r in &cfg.toml.kernel.extern_regions {
+            if let Some(v) = alloc_regions.get(r) {
+                bail!(
+                    "cannot use region '{r}' as extern region in \
+                    the kernel because it's used as a normal region by \
+                    [{}]",
+                    v.join(", ")
+                );
             }
         }
 
@@ -629,19 +645,28 @@ pub fn package(
         write_gdb_script(&cfg, image_name)?;
         let archive_name = build_archive(&cfg, image_name, raw_image)?;
 
-        // Post-build modifications: populate a default caboose if requested
-        if let Some(caboose) = &cfg.toml.caboose {
-            if caboose.default {
-                let mut archive =
-                    hubtools::RawHubrisArchive::load(&archive_name)
-                        .context("loading archive with hubtools")?;
-                // The Git hash is included in the default caboose under the key
-                // `GITC`, so we don't include it in the pseudo-version.
-                archive
-                    .write_default_caboose(None)
-                    .context("writing caboose into archive")?;
-                archive.overwrite().context("overwriting archive")?;
+        // Post-build modifications: populate the caboose if requested
+        if cfg.toml.caboose.is_some() {
+            let mut archive = hubtools::RawHubrisArchive::load(&archive_name)
+                .context("loading archive with hubtools")?;
+            if let Some(ref vers) = caboose_args.version_override {
+                println!("note: asked to override caboose `VERS` to {vers:?}");
             }
+            // The Git hash is included in the default caboose under the key
+            // `GITC`, so we don't include it in the pseudo-version.
+            archive
+                .write_default_caboose(caboose_args.version_override.as_ref())
+                .context("writing caboose into archive")?;
+            archive.overwrite().context("overwriting archive")?;
+        } else if let Some(ref vers) = caboose_args.version_override {
+            // If there's no caboose, the version override does nothing --- make
+            // sure the user realizes that.
+            eprintln!(
+                "warning: ignoring overridden caboose version \
+                 (HUBRIS_CABOOSE_VERS={vers:?}) as {} does not have a \
+                 `[caboose]` section!",
+                app_toml.display()
+            );
         }
 
         // Post-build modifications: sign the image if requested
@@ -692,15 +717,11 @@ pub fn package(
             archive.overwrite()?;
         }
 
-        if cfg.toml.fwid {
-            write_fwid(&cfg, image_name, &flash, &archive_name)?;
-        }
-
         // Unzip the signed + caboose'd images into our build directory
         let archive = hubtools::RawHubrisArchive::load(&archive_name)
             .context("loading archive with hubtools")?;
         for ext in ["elf", "bin"] {
-            let name = format!("final.{}", ext);
+            let name = format!("final.{ext}");
             let file_data = archive
                 .extract_file(&format!("img/{name}"))
                 .context("extracting signed file from archive")?;
@@ -708,67 +729,6 @@ pub fn package(
         }
     }
     Ok(allocated)
-}
-
-// generate file with hash of expected flash contents
-fn write_fwid(
-    cfg: &PackageConfig,
-    image_name: &str,
-    flash: &Range<u32>,
-    archive_name: &PathBuf,
-) -> Result<()> {
-    let mut archive = hubtools::RawHubrisArchive::load(archive_name)
-        .context("loading archive with hubtools")?;
-
-    let bin = archive
-        .extract_file("img/final.bin")
-        .context("extracting final.bin after signing & caboosing")?;
-
-    let chip_name = Path::new(&cfg.toml.chip);
-
-    // determine length of padding
-    let pad = match chip_name.file_name().and_then(OsStr::to_str) {
-        Some("lpc55") => {
-            // Flash is programmed in 512 blocks. If the final block is not
-            // filled, it is padded with 0xff's. Unwritten flash pages cannot
-            // be read and are not included in the FWID calculation.
-            LPC55_FLASH_PAGE_SIZE - bin.len() % LPC55_FLASH_PAGE_SIZE
-        }
-        Some("stm32h7") => {
-            // all unprogrammed flash is read as 0xff
-            flash.end as usize - flash.start as usize - bin.len()
-        }
-        Some(c) => {
-            bail!("no FWID algorithm defined for chip: \"{}\"", c)
-        }
-        None => bail!("Failed to get file name of {}", chip_name.display()),
-    };
-
-    let mut sha = Sha3_256::new();
-    sha.update(&bin);
-
-    if pad != 0 {
-        sha.update(vec![0xff_u8; pad])
-    }
-
-    let digest = sha.finalize();
-
-    // after we've appended a newline fwid is immutable
-    let mut fwid = hex::encode(digest);
-    writeln!(fwid).context("appending newline to FWID")?;
-    let fwid = fwid;
-
-    // the archive already exists so we write the FWID to the same path in
-    // the build output and archive to keep the two consistent
-    fs::write(cfg.img_file("final.fwid", image_name), &fwid)
-        .context("writing FWID to build output")?;
-    archive
-        .add_file("img/final.fwid", fwid.as_bytes())
-        .context("writing FWID to archive")?;
-
-    archive.overwrite()?;
-
-    Ok(())
 }
 
 fn write_gdb_script(cfg: &PackageConfig, image_name: &str) -> Result<()> {
@@ -800,7 +760,7 @@ fn write_gdb_script(cfg: &PackageConfig, image_name: &str) -> Result<()> {
         if cfg!(windows) {
             path_str = path_str.replace('\\', "/");
         }
-        writeln!(gdb_script, "set substitute-path {} {}", remap, path_str)?;
+        writeln!(gdb_script, "set substitute-path {remap} {path_str}")?;
     }
     Ok(())
 }
@@ -843,9 +803,16 @@ fn build_archive(
     archive.text("app.toml", &cfg.toml.app_config)?;
 
     let chip_dir = cfg.app_src_dir.join(cfg.toml.chip.clone());
-    let chip_file = chip_dir.join("chip.toml");
-    let chip_filename = chip_file.file_name().unwrap();
-    archive.copy(&chip_file, chip_filename)?;
+
+    // Generate a synthetic `chip.toml` by serializing our peripheral map,
+    // because we may have added addition FMC peripherals.
+    archive
+        .text(
+            "chip.toml",
+            toml::to_string(&cfg.toml.peripherals)
+                .context("could not serialize chip.toml")?,
+        )
+        .context("could not write chip.toml")?;
 
     archive
         .text(
@@ -888,7 +855,7 @@ fn build_archive(
     if let Some(auxflash) = cfg.toml.auxflash.as_ref() {
         let file = cfg.dist_file("auxi.tlvc");
         std::fs::write(&file, &auxflash.data)
-            .context(format!("Failed to write auxi to {:?}", file))?;
+            .context(format!("Failed to write auxi to {file:?}"))?;
         archive.copy(cfg.dist_file("auxi.tlvc"), img_dir.join("auxi.tlvc"))?;
     }
 
@@ -1075,7 +1042,7 @@ fn build_task(cfg: &PackageConfig, name: &str) -> Result<()> {
         .task_build_config(name, cfg.verbose, Some(&cfg.sysroot))
         .unwrap();
     build(cfg, name, build_config, true)
-        .context(format!("failed to build {}", name))
+        .context(format!("failed to build {name}"))
 }
 
 /// Checks whether the given task can overflow its stack
@@ -1387,7 +1354,7 @@ fn link_task(
     image_name: &str,
     allocs: &Allocations,
 ) -> Result<()> {
-    println!("linking task '{}'", name);
+    println!("linking task '{name}'");
     let task_toml = &cfg.toml.tasks[name];
 
     let extern_regions = cfg.toml.extern_regions_for(name, image_name)?;
@@ -1402,15 +1369,11 @@ fn link_task(
         &extern_regions,
         image_name,
     )
-    .context(format!("failed to generate linker script for {}", name))?;
+    .context(format!("failed to generate linker script for {name}"))?;
     fs::copy("build/task-link.x", "target/link.x")?;
 
     // Link the static archive
-    link(
-        cfg,
-        format!("{}.elf", name),
-        format!("{}/{}", image_name, name),
-    )
+    link(cfg, format!("{name}.elf"), format!("{image_name}/{name}"))
 }
 
 /// Link a specific task using a dummy linker script that gives it all possible
@@ -1441,11 +1404,11 @@ fn link_dummy_task(
         &extern_regions,
         &cfg.toml.image_names[0],
     )
-    .context(format!("failed to generate linker script for {}", name))?;
+    .context(format!("failed to generate linker script for {name}"))?;
     fs::copy("build/task-tlink.x", "target/link.x")?;
 
     // Link the static archive
-    link(cfg, format!("{}.elf", name), format!("{}.tmp", name))
+    link(cfg, format!("{name}.elf"), format!("{name}.tmp"))
 }
 
 fn task_size<'a>(
@@ -1512,11 +1475,13 @@ fn build_kernel(
     kconfig.hash(&mut image_id);
     allocs.hash(&mut image_id);
 
+    let extern_regions = cfg.toml.kernel_extern_regions(image_name)?;
     generate_kernel_linker_script(
         "memory.x",
         &allocs.kernel,
         cfg.toml.kernel.stacksize.unwrap_or(DEFAULT_KERNEL_STACK),
         &cfg.toml.all_regions("flash".to_string())?,
+        &extern_regions,
         image_name,
     )?;
 
@@ -1535,7 +1500,7 @@ fn build_kernel(
         cfg.verbose,
         &[
             ("HUBRIS_KCONFIG", &kconfig),
-            ("HUBRIS_IMAGE_ID", &format!("{}", image_id)),
+            ("HUBRIS_IMAGE_ID", &format!("{image_id}")),
             ("HUBRIS_FLASH_OUTPUTS", &flash_outputs),
         ],
         Some(&cfg.sysroot),
@@ -1749,13 +1714,12 @@ fn generate_task_linker_script(
     image_name: &str,
 ) -> Result<()> {
     // Put the linker script somewhere the linker can find it
-    let mut linkscr = File::create(Path::new(&format!("target/{}", name)))?;
+    let mut linkscr = File::create(Path::new(&format!("target/{name}")))?;
 
     fn emit(linkscr: &mut File, sec: &str, o: u32, l: u32) -> Result<()> {
         writeln!(
             linkscr,
-            "{} (rwx) : ORIGIN = {:#010x}, LENGTH = {:#010x}",
-            sec, o, l
+            "{sec} (rwx) : ORIGIN = {o:#010x}, LENGTH = {l:#010x}",
         )?;
         Ok(())
     }
@@ -1795,7 +1759,6 @@ fn generate_task_linker_script(
 
 fn append_image_names(
     linkscr: &mut std::fs::File,
-
     images: &IndexMap<String, Range<u32>>,
     image_name: &str,
 ) -> Result<()> {
@@ -1850,8 +1813,8 @@ fn append_task_sections(
     if let Some(map) = sections {
         writeln!(out, "SECTIONS {{")?;
         for (section, memory) in map {
-            writeln!(out, "  .{} (NOLOAD) : ALIGN(4) {{", section)?;
-            writeln!(out, "    *(.{} .{}.*);", section, section)?;
+            writeln!(out, "  .{section} (NOLOAD) : ALIGN(4) {{")?;
+            writeln!(out, "    *(.{section} .{section}.*);")?;
             writeln!(out, "  }} > {}", memory.to_ascii_uppercase())?;
         }
         writeln!(out, "}} INSERT AFTER .uninit")?;
@@ -1865,11 +1828,12 @@ fn generate_kernel_linker_script(
     map: &BTreeMap<String, Range<u32>>,
     stacksize: u32,
     images: &IndexMap<String, Range<u32>>,
+    extern_regions: &IndexMap<String, Range<u32>>,
     image_name: &str,
 ) -> Result<()> {
     // Put the linker script somewhere the linker can find it
     let mut linkscr =
-        File::create(Path::new(&format!("target/{}", name))).unwrap();
+        File::create(Path::new(&format!("target/{name}"))).unwrap();
 
     let mut stack_start = None;
     let mut stack_base = None;
@@ -1892,8 +1856,7 @@ fn generate_kernel_linker_script(
             stack_base = Some(start);
             writeln!(
                 linkscr,
-                "STACK (rw) : ORIGIN = {:#010x}, LENGTH = {:#010x}",
-                start, stacksize,
+                "STACK (rw) : ORIGIN = {start:#010x}, LENGTH = {stacksize:#010x}",
             )?;
             start += stacksize;
             stack_start = Some(start);
@@ -1931,6 +1894,7 @@ fn generate_kernel_linker_script(
     .unwrap();
 
     append_image_names(&mut linkscr, images, image_name)?;
+    append_extern_regions(&mut linkscr, extern_regions)?;
     Ok(())
 }
 
@@ -1968,7 +1932,7 @@ fn build(
         });
     cmd.env(
         "RUSTFLAGS",
-        &format!(
+        format!(
             "-C link-arg=-z -C link-arg=common-page-size=0x20 \
              -C link-arg=-z -C link-arg=max-page-size=0x20 \
              -C llvm-args=--enable-machine-outliner=never \
@@ -2004,7 +1968,7 @@ fn build(
         );
         let tree_status = tree
             .status()
-            .context(format!("failed to run edge ({:?})", tree))?;
+            .context(format!("failed to run edge ({tree:?})"))?;
         if !tree_status.success() {
             bail!("tree command failed, see output for details");
         }
@@ -2047,7 +2011,7 @@ fn build(
 
     let status = child
         .wait()
-        .context(format!("failed to run rustc ({:?})", cmd))?;
+        .context(format!("failed to run rustc ({cmd:?})"))?;
     let stderr_bytes = reader_thread.join().unwrap();
 
     if !status.success() {
@@ -2119,7 +2083,7 @@ fn build(
     // Destination where it should be copied (using the task name rather than
     // the crate name)
     let dest = cfg.dist_file(if reloc {
-        format!("{}.elf", name)
+        format!("{name}.elf")
     } else {
         name.to_string()
     });
@@ -2154,8 +2118,8 @@ fn link(
     // our working directory here
     let working_dir = &cfg.dist_dir;
     for f in ["link.x", "memory.x"] {
-        std::fs::copy(format!("target/{}", f), working_dir.join(f))
-            .context(format!("Could not copy {} to link dir", f))?;
+        std::fs::copy(format!("target/{f}"), working_dir.join(f))
+            .context(format!("Could not copy {f} to link dir"))?;
     }
     assert!(AsRef::<Path>::as_ref(&src_file).is_relative());
     assert!(AsRef::<Path>::as_ref(&dst_file).is_relative());
@@ -2178,7 +2142,7 @@ fn link(
 
     let status = cmd
         .status()
-        .context(format!("failed to run linker ({:?})", cmd))?;
+        .context(format!("failed to run linker ({cmd:?})"))?;
 
     if !status.success() {
         bail!("command failed, see output for details");
@@ -2842,6 +2806,11 @@ pub fn make_kconfig(
     flat_shared.retain(|name, _v| used_shared_regions.contains(name.as_str()));
 
     Ok(build_kconfig::KernelConfig {
+        features: toml.kernel.features.clone(),
+        extern_regions: toml
+            .kernel_extern_regions(image_name)?
+            .into_iter()
+            .collect(),
         irqs,
         tasks,
         shared_regions: flat_shared,
@@ -3053,7 +3022,7 @@ fn get_git_status() -> Result<(String, bool)> {
     cmd.arg("diff-index").arg("--quiet").arg("HEAD").arg("--");
     let status = cmd
         .status()
-        .context(format!("failed to get git status ({:?})", cmd))?;
+        .context(format!("failed to get git status ({cmd:?})"))?;
 
     Ok((rev, !status.success()))
 }
@@ -3061,7 +3030,7 @@ fn get_git_status() -> Result<(String, bool)> {
 fn cargo_clean(names: &[&str], target: &str) -> Result<()> {
     let mut cmd = Command::new("cargo");
     cmd.arg("clean");
-    println!("cleaning {:?}", names);
+    println!("cleaning {names:?}");
     for name in names {
         cmd.arg("-p").arg(name);
     }
@@ -3069,7 +3038,7 @@ fn cargo_clean(names: &[&str], target: &str) -> Result<()> {
 
     let status = cmd
         .status()
-        .context(format!("failed to cargo clean ({:?})", cmd))?;
+        .context(format!("failed to cargo clean ({cmd:?})"))?;
 
     if !status.success() {
         bail!("command failed, see output for details");

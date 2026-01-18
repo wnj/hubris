@@ -22,6 +22,9 @@
 // and needs attention!
 //
 #![allow(static_mut_refs)]
+// This is necessary in order to use the `#[used(compiler)]` attribute on Hiffy
+// statics which are written to by Humility, and must not be optimized out.
+#![feature(used_with_arg)]
 
 // This trait may not be needed, if compiling for a non-armv6m target.
 #[allow(unused_imports)]
@@ -52,6 +55,12 @@ cfg_if::cfg_if! {
     }
 }
 
+#[cfg(all(feature = "turbo", feature = "micro"))]
+compile_error!(
+    "enabling the 'micro' feature takes precedent over the 'turbo' feature,
+     as both control memory buffer size"
+);
+
 cfg_if::cfg_if! {
     //
     // The "micro" feature denotes a minimal RAM footprint.  Note that this
@@ -65,53 +74,48 @@ cfg_if::cfg_if! {
         const HIFFY_DATA_SIZE: usize = 256;
         const HIFFY_TEXT_SIZE: usize = 256;
         const HIFFY_RSTACK_SIZE: usize = 64;
-    } else if #[cfg(any(
-        target_board = "gimlet-b",
-        target_board = "gimlet-c",
-        target_board = "gimlet-d",
-        target_board = "gimlet-e",
-        target_board = "gimlet-f",
-        target_board = "sidecar-b",
-        target_board = "gimletlet-2",
-        target_board = "nucleo-h743zi2",
-        target_board = "nucleo-h753zi",
-        target_board = "grapefruit",
-    ))] {
+        const HIFFY_SCRATCH_SIZE: usize = 512;
+    } else if #[cfg(feature = "turbo")] {
+        //
+        // go-faster mode
+        //
         const HIFFY_DATA_SIZE: usize = 20_480;
-        const HIFFY_TEXT_SIZE: usize = 2048;
+        const HIFFY_TEXT_SIZE: usize = 4096;
         const HIFFY_RSTACK_SIZE: usize = 2048;
+
+        /// Number of "scratch" bytes available to Hiffy programs. Humility uses this
+        /// to deliver data used by some operations. This number can be increased at
+        /// the cost of RAM.
+        const HIFFY_SCRATCH_SIZE: usize = 1024;
     } else if #[cfg(any(target_board = "donglet-g031", target_board = "oxcon2023g0"))] {
         const HIFFY_DATA_SIZE: usize = 256;
         const HIFFY_TEXT_SIZE: usize = 256;
         const HIFFY_RSTACK_SIZE: usize = 2048;
+        const HIFFY_SCRATCH_SIZE: usize = 512;
     } else {
         const HIFFY_DATA_SIZE: usize = 2_048;
         const HIFFY_TEXT_SIZE: usize = 2048;
         const HIFFY_RSTACK_SIZE: usize = 2048;
+        const HIFFY_SCRATCH_SIZE: usize = 512;
     }
 }
 
-/// Number of "scratch" bytes available to Hiffy programs. Humility uses this
-/// to deliver data used by some operations. This number can be increased at
-/// the cost of RAM.
-const HIFFY_SCRATCH_SIZE: usize = 512;
-
-///
-/// These HIFFY_* global variables constitute the interface with Humility;
-/// they should not be altered without modifying Humility as well.
-///
-/// - [`HIFFY_TEXT`]       => Program text for HIF operations
-/// - [`HIFFY_DATA`]       => Binary data from the caller
-/// - [`HIFFY_RSTACK`]     => HIF return stack
-/// - [`HIFFY_SCRATCH`]    => Scratch space for hiffy functions
-/// - [`HIFFY_REQUESTS`]   => Count of succesful requests
-/// - [`HIFFY_ERRORS`]     => Count of HIF execution failures
-/// - [`HIFFY_FAILURE`]    => Most recent HIF failure, if any
-/// - [`HIFFY_KICK`]       => Variable that will be written to to indicate that
-///                           [`HIFFY_TEXT`] contains valid program text
-/// - [`HIFFY_READY`]      => Variable that will be non-zero iff the HIF
-///                           execution engine is waiting to be kicked
-///
+//
+// These HIFFY_* global variables constitute the interface with Humility;
+// they should not be altered without modifying Humility as well.
+//
+// - [`HIFFY_TEXT`]       => Program text for HIF operations
+// - [`HIFFY_DATA`]       => Binary data from the caller
+// - [`HIFFY_RSTACK`]     => HIF return stack
+// - [`HIFFY_SCRATCH`]    => Scratch space for hiffy functions
+// - [`HIFFY_REQUESTS`]   => Count of succesful requests
+// - [`HIFFY_ERRORS`]     => Count of HIF execution failures
+// - [`HIFFY_FAILURE`]    => Most recent HIF failure, if any
+// - [`HIFFY_KICK`]       => Variable that will be written to to indicate that
+//                           [`HIFFY_TEXT`] contains valid program text
+// - [`HIFFY_READY`]      => Variable that will be non-zero iff the HIF
+//                           execution engine is waiting to be kicked
+//
 static mut HIFFY_TEXT: [u8; HIFFY_TEXT_SIZE] = [0; HIFFY_TEXT_SIZE];
 static mut HIFFY_DATA: [u8; HIFFY_DATA_SIZE] = [0; HIFFY_DATA_SIZE];
 static mut HIFFY_RSTACK: [u8; HIFFY_RSTACK_SIZE] = [0; HIFFY_RSTACK_SIZE];
@@ -119,9 +123,13 @@ static mut HIFFY_RSTACK: [u8; HIFFY_RSTACK_SIZE] = [0; HIFFY_RSTACK_SIZE];
 static HIFFY_SCRATCH: StaticCell<[u8; HIFFY_SCRATCH_SIZE]> =
     StaticCell::new([0; HIFFY_SCRATCH_SIZE]);
 
+#[used]
 static HIFFY_REQUESTS: AtomicU32 = AtomicU32::new(0);
+#[used]
 static HIFFY_ERRORS: AtomicU32 = AtomicU32::new(0);
+#[used]
 static HIFFY_KICK: AtomicU32 = AtomicU32::new(0);
+#[used]
 static HIFFY_READY: AtomicU32 = AtomicU32::new(0);
 
 #[used]
@@ -131,8 +139,11 @@ static mut HIFFY_FAILURE: Option<Failure> = None;
 /// We deliberately export the HIF version numbers to allow Humility to
 /// fail cleanly if its HIF version does not match our own.
 ///
+#[used]
 static HIFFY_VERSION_MAJOR: AtomicU32 = AtomicU32::new(HIF_VERSION_MAJOR);
+#[used]
 static HIFFY_VERSION_MINOR: AtomicU32 = AtomicU32::new(HIF_VERSION_MINOR);
+#[used]
 static HIFFY_VERSION_PATCH: AtomicU32 = AtomicU32::new(HIF_VERSION_PATCH);
 
 #[export_name = "main"]

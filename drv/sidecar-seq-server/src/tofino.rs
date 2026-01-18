@@ -84,11 +84,16 @@ impl Tofino {
         self.abort_reported = false;
         self.sequencer.set_enable(true)?;
 
-        // Wait for the VID to become valid, retrying if needed.
-        for i in 1..4 {
+        // Wait for the VID to become valid, retrying as needed.
+        // Note that we don't check that the FPGA is in the correct state here
+        // before looping, which means that we might already be timed out before
+        // even starting this loop if the SP had been paused by the debugger at
+        // an in-opportune moment during bootup.
+        for i in 0..8 {
+            ringbuf_entry!(Trace::TofinoVidAttempt(i));
             // Sleep first since there is a delay between the sequencer
             // receiving the EN bit and the VID being valid.
-            hl::sleep_for(i * 25);
+            hl::sleep_for(50);
 
             let maybe_vid = self.sequencer.vid().map_err(|e| {
                 if let FpgaError::InvalidValue = e {
@@ -104,6 +109,50 @@ impl Tofino {
                 self.apply_vid(vid)?;
                 self.sequencer.ack_vid()?;
                 ringbuf_entry!(Trace::TofinoVidAck);
+
+                // The Tofino E&M Specification (TF2-DS2-003EA.pdf) specifies a
+                // need for at least 200ms between POR release and PERST
+                // release to allow for HW initialization and VDD to settle
+                // at the VID value. The FPGA tracks the timing here, so wait
+                // until it signifies this time has elapsed by officially
+                // entering the A0 power state. Currently the FPGA thinks
+                // this will happen within 250 ms after releasing POR, since
+                // VID has been successfully changed at this point there
+                // really isn't more to do but wait for the FPGA to tell us
+                // we're in A0.
+                let mut in_a0 = false;
+                let mut tries: u8 = 0;
+                const MAX_TRIES: u8 = 12; // 12 * 25ms = 300ms
+                while !in_a0 {
+                    match self.sequencer.state() {
+                        Ok(state) => {
+                            in_a0 = state == TofinoSeqState::A0;
+                            if !in_a0 {
+                                if tries > MAX_TRIES {
+                                    ringbuf_entry_root!(
+                                        Trace::TofinoSequencerError(
+                                            SeqError::SequencerTimeoutNotInA0
+                                        )
+                                    );
+                                    return Err(
+                                        SeqError::SequencerTimeoutNotInA0,
+                                    );
+                                }
+                                tries += 1;
+                                ringbuf_entry!(Trace::TofinoNotInA0);
+                                hl::sleep_for(25);
+                            }
+                        }
+                        Err(_) => {
+                            ringbuf_entry!(Trace::TofinoSequencerError(
+                                SeqError::FpgaError
+                            ));
+                            return Err(SeqError::FpgaError);
+                        }
+                    }
+                }
+
+                ringbuf_entry!(Trace::TofinoInA0);
 
                 // Keep the PCIe PHY lanes in reset and delay PCIE_INIT so
                 // changes to the config can be made after loading parameters
@@ -253,10 +302,12 @@ impl Tofino {
                 self.set_pcie_present(true)?;
 
                 return Ok(());
+            } else {
+                ringbuf_entry!(Trace::TofinoNoVid);
             }
         }
 
-        Err(SeqError::SequencerTimeout)
+        Err(SeqError::SequencerTimeoutNoTofinoVid)
     }
 
     pub fn power_down(&mut self) -> Result<(), SeqError> {

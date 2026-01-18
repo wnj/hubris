@@ -18,7 +18,7 @@ use ringbuf::{counted_ringbuf, ringbuf_entry};
 use static_cell::ClaimOnceCell;
 use task_control_plane_agent_api::MAX_INSTALLINATOR_IMAGE_ID_LEN;
 use task_control_plane_agent_api::{
-    BarcodeParseError, ControlPlaneAgentError, UartClient, VpdIdentity,
+    BarcodeParseError, ControlPlaneAgentError, OxideIdentity, UartClient,
 };
 use task_net_api::{
     Address, LargePayloadBehavior, Net, RecvError, SendError, SocketName,
@@ -159,6 +159,9 @@ enum MgsMessage {
         slot: u16,
         persist: bool,
     },
+    ComponentGetPersistentSlot {
+        component: SpComponent,
+    },
     SerialConsoleBreak,
     SendHostNmi,
     SetIpccKeyValue {
@@ -169,6 +172,15 @@ enum MgsMessage {
     VpdLockStatus,
     VersionedRotBootInfo {
         version: u8,
+    },
+    ReadHostFlash {
+        addr: u32,
+    },
+    StartHostFlashHash {
+        slot: u16,
+    },
+    GetHostFlashHash {
+        slot: u16,
     },
 }
 
@@ -252,16 +264,16 @@ impl NotificationHandler for ServerImpl {
             | notifications::TIMER_MASK
     }
 
-    fn handle_notification(&mut self, bits: u32) {
-        if (bits & notifications::USART_IRQ_MASK) != 0 {
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
+        if bits.check_notification_mask(notifications::USART_IRQ_MASK) {
             self.mgs_handler.drive_usart();
         }
 
-        if (bits & notifications::TIMER_MASK) != 0 {
+        if bits.has_timer_fired(notifications::TIMER_MASK) {
             self.mgs_handler.handle_timer_fired();
         }
 
-        if (bits & notifications::SOCKET_MASK) != 0
+        if bits.check_notification_mask(notifications::SOCKET_MASK)
             || self.net_handler.packet_to_send.is_some()
             || self.mgs_handler.wants_to_send_packet_to_mgs()
         {
@@ -323,7 +335,7 @@ impl idl::InOrderControlPlaneAgentImpl for ServerImpl {
     fn identity(
         &mut self,
         _msg: &userlib::RecvMessage,
-    ) -> Result<VpdIdentity, RequestError<core::convert::Infallible>> {
+    ) -> Result<OxideIdentity, RequestError<core::convert::Infallible>> {
         ringbuf_entry!(Log::IpcRequest(IpcRequest::Identity));
         Ok(self.mgs_handler.identity())
     }
@@ -599,7 +611,7 @@ const fn usize_max(a: usize, b: usize) -> usize {
 
 mod idl {
     use task_control_plane_agent_api::{
-        ControlPlaneAgentError, HostStartupOptions, UartClient, VpdIdentity,
+        ControlPlaneAgentError, HostStartupOptions, OxideIdentity, UartClient,
     };
     include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
 }

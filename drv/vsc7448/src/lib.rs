@@ -179,7 +179,7 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
                 }
             },
             PortMode::Qsgmii(_) => {
-                if p % 4 == 0 {
+                if p.is_multiple_of(4) {
                     self.init_qsgmii(p, cfg)
                 } else {
                     // All QSGMII ports are initialized with the base port
@@ -824,6 +824,32 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
         Ok(())
     }
 
+    /// Implements a VLAN scheme for the minibar development board
+    ///
+    /// Rear I/O 0 can only talk to the sled's SW0 SP interface.
+    /// Rear I/0 1 can only talk to the sled's SW1 SP interface.
+    /// Rear I/0 2 can only talk to the minibar's SP.
+    /// Packets are not switched between rear IO ports.
+    pub fn configure_vlan_minibar(&self) -> Result<(), VscError> {
+        self.configure_vlans(|p| match p {
+            minibar::REAR_IO_0 => Some((1 << p) | (1 << minibar::SLED_SP_0)),
+            minibar::REAR_IO_1 => Some((1 << p) | (1 << minibar::SLED_SP_1)),
+            minibar::REAR_IO_2 => Some(
+                (1 << p)
+                    | (1 << minibar::LOCAL_SP_0)
+                    | (1 << minibar::LOCAL_SP_1),
+            ),
+            minibar::SLED_SP_0 => Some((1 << p) | (1 << minibar::REAR_IO_0)),
+            minibar::SLED_SP_1 => Some((1 << p) | (1 << minibar::REAR_IO_1)),
+            minibar::LOCAL_SP_0 | minibar::LOCAL_SP_1 => {
+                Some((1 << p) | (1 << minibar::REAR_IO_2))
+            }
+            _ => None,
+        })?;
+        self.configure_port_tagged(|_| false)?; // all ports are untagged
+        Ok(())
+    }
+
     /// Implements the VLAN scheme described in RFD 492, locked
     ///
     /// To switch between locked and unlocked later, use
@@ -940,4 +966,14 @@ mod sidecar {
 
     /// Technician port 2 (front IO board)
     pub const TECHNICIAN_2: u8 = 45;
+}
+
+mod minibar {
+    pub const LOCAL_SP_0: u8 = 0;
+    pub const LOCAL_SP_1: u8 = 1;
+    pub const SLED_SP_0: u8 = 2;
+    pub const SLED_SP_1: u8 = 3;
+    pub const REAR_IO_0: u8 = 40;
+    pub const REAR_IO_1: u8 = 41;
+    pub const REAR_IO_2: u8 = 42;
 }

@@ -18,10 +18,10 @@ task_slot!(SP_CTRL, swd);
 
 #[derive(Copy, Clone, PartialEq)]
 enum Trace {
+    None,
     Execute((usize, hif::Op)),
     Failure(Failure),
     Success,
-    None,
 }
 
 ringbuf!(Trace, 64, Trace::None);
@@ -75,6 +75,8 @@ pub enum Functions {
     ReadFromSp((u32, u32), drv_sp_ctrl_api::SpCtrlError),
     #[cfg(feature = "spctrl")]
     SpCtrlInit((), drv_sp_ctrl_api::SpCtrlError),
+    #[cfg(feature = "spctrl")]
+    DbResetSp((), drv_sp_ctrl_api::SpCtrlError),
 }
 
 #[cfg(feature = "spctrl")]
@@ -380,7 +382,7 @@ pub(crate) static HIFFY_FUNCS: &[Function] = &[
 // This definition forces the compiler to emit the DWARF needed for debuggers
 // to be able to know function indices, arguments and return values.
 //
-#[used]
+#[used(compiler)]
 static HIFFY_FUNCTIONS: Option<&Functions> = None;
 
 pub(crate) fn trace_execute(offset: usize, op: hif::Op) {

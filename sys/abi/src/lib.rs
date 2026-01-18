@@ -8,7 +8,7 @@
 #![forbid(clippy::wildcard_imports)]
 
 use serde::{Deserialize, Serialize};
-use zerocopy::{AsBytes, FromBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Names a particular incarnation of a task.
 ///
@@ -87,12 +87,20 @@ impl From<u8> for Generation {
     }
 }
 
+impl From<Generation> for u8 {
+    fn from(x: Generation) -> Self {
+        x.0
+    }
+}
+
 /// Newtype wrapper for an interrupt index
 #[derive(
     Copy,
     Clone,
     Debug,
     FromBytes,
+    Immutable,
+    KnownLayout,
     Serialize,
     Deserialize,
     Hash,
@@ -124,6 +132,8 @@ impl InterruptNum {
     Clone,
     Debug,
     FromBytes,
+    Immutable,
+    KnownLayout,
     Serialize,
     Deserialize,
     Hash,
@@ -158,7 +168,9 @@ impl InterruptOwner {
 }
 
 /// Description of one interrupt response.
-#[derive(Clone, Debug, FromBytes, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, FromBytes, Immutable, KnownLayout, Serialize, Deserialize,
+)]
 pub struct Interrupt {
     /// Which interrupt number is being hooked.
     pub irq: InterruptNum,
@@ -170,7 +182,7 @@ pub struct Interrupt {
 ///
 /// At SEND, the task gives us the base and length of a section of memory that
 /// it *claims* contains structs of this type.
-#[derive(Copy, Clone, Debug, FromBytes)]
+#[derive(Copy, Clone, Debug, FromBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct ULease {
     /// Lease attributes.
@@ -183,7 +195,9 @@ pub struct ULease {
     pub length: u32,
 }
 
-#[derive(Copy, Clone, Debug, FromBytes, PartialEq, Eq)]
+#[derive(
+    Copy, Clone, Debug, FromBytes, Immutable, KnownLayout, PartialEq, Eq,
+)]
 #[repr(transparent)]
 pub struct LeaseAttributes(u32);
 
@@ -490,7 +504,7 @@ pub struct TaskDumpRegion {
 /// Representation of kipc numbers
 pub enum Kipcnum {
     ReadTaskStatus = 1,
-    RestartTask = 2,
+    ReinitTask = 2,
     FaultTask = 3,
     ReadImageId = 4,
     Reset = 5,
@@ -498,6 +512,7 @@ pub enum Kipcnum {
     ReadTaskDumpRegion = 7,
     SoftwareIrq = 8,
     FindFaultedTask = 9,
+    ReadPanicMessage = 10,
 }
 
 impl core::convert::TryFrom<u16> for Kipcnum {
@@ -506,7 +521,7 @@ impl core::convert::TryFrom<u16> for Kipcnum {
     fn try_from(x: u16) -> Result<Self, Self::Error> {
         match x {
             1 => Ok(Self::ReadTaskStatus),
-            2 => Ok(Self::RestartTask),
+            2 => Ok(Self::ReinitTask),
             3 => Ok(Self::FaultTask),
             4 => Ok(Self::ReadImageId),
             5 => Ok(Self::Reset),
@@ -514,6 +529,7 @@ impl core::convert::TryFrom<u16> for Kipcnum {
             7 => Ok(Self::ReadTaskDumpRegion),
             8 => Ok(Self::SoftwareIrq),
             9 => Ok(Self::FindFaultedTask),
+            10 => Ok(Self::ReadPanicMessage),
             _ => Err(()),
         }
     }
@@ -525,7 +541,7 @@ pub const CABOOSE_MAGIC: u32 = 0xCAB0_005E;
 /// TODO: Add hash for integrity check
 /// Later this will also be a signature block
 #[repr(C)]
-#[derive(Default, AsBytes, FromBytes)]
+#[derive(Default, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct ImageHeader {
     pub magic: u32,
     pub total_image_len: u32,
@@ -537,7 +553,7 @@ pub struct ImageHeader {
 // Corresponds to the ARM vector table, limited to what we need
 // see ARMv8m B3.30 and B1.5.3 ARMv7m for the full description
 #[repr(C)]
-#[derive(Default, AsBytes)]
+#[derive(Default, IntoBytes, KnownLayout, Immutable)]
 pub struct ImageVectors {
     pub sp: u32,
     pub entry: u32,
@@ -566,5 +582,37 @@ bitflags::bitflags! {
         /// If present, requests that any pending instance of this interrupt be
         // cleared.
         const CLEAR_PENDING = 1 << 1;
+    }
+}
+
+/// Errors returned by [`Kipcnum::ReadPanicMessage`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ReadPanicMessageError {
+    /// The task in question has not panicked.
+    TaskNotPanicked = 1,
+    /// The task has panicked, but its panic message buffer is invalid, so the
+    /// kernel has not let us have it.
+    ///
+    /// In practice, this is quite unlikely, and would require the task to have
+    /// panicked with a panic message slice of a length that exceeds the end of
+    /// the address space. Panicking via the Hubris userlib will never do this.
+    /// But, since the panicked task could be any arbitrary binary...anything is
+    /// possible.
+    BadPanicBuffer = 2,
+}
+
+/// We're using an explicit `TryFrom` impl for `ReadPanicMessageError` instead of
+/// `FromPrimitive` because the kernel doesn't currently depend on `num-traits`
+/// and this seems okay.
+impl core::convert::TryFrom<u32> for ReadPanicMessageError {
+    type Error = ();
+
+    fn try_from(x: u32) -> Result<Self, Self::Error> {
+        match x {
+            1 => Ok(Self::TaskNotPanicked),
+            2 => Ok(Self::BadPanicBuffer),
+            _ => Err(()),
+        }
     }
 }

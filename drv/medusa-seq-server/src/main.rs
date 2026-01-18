@@ -62,8 +62,6 @@ enum Trace {
 
 ringbuf!(Trace, 32, Trace::None);
 
-const TIMER_INTERVAL: u64 = 1000;
-
 struct ServerImpl {
     power_control: PowerControl,
     front_io_board: Option<FrontIOBoard>,
@@ -279,13 +277,11 @@ impl idl::InOrderSequencerImpl for ServerImpl {
 
 impl NotificationHandler for ServerImpl {
     fn current_notification_mask(&self) -> u32 {
-        notifications::TIMER_MASK
+        0
     }
 
-    fn handle_notification(&mut self, _bits: u32) {
-        let next_deadline = sys_get_timer().now + TIMER_INTERVAL;
-
-        sys_set_timer(Some(next_deadline), notifications::TIMER_MASK);
+    fn handle_notification(&mut self, _bits: userlib::NotificationBits) {
+        unreachable!()
     }
 }
 
@@ -339,10 +335,6 @@ fn main() -> ! {
         ringbuf_entry!(Trace::PhyPowerGood);
     }
 
-    // This will put our timer in the past, and should immediately kick us.
-    let deadline = sys_get_timer().now;
-    sys_set_timer(Some(deadline), notifications::TIMER_MASK);
-
     loop {
         idol_runtime::dispatch(&mut buffer, &mut server);
     }
@@ -353,5 +345,3 @@ mod idl {
 
     include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
 }
-
-include!(concat!(env!("OUT_DIR"), "/notifications.rs"));

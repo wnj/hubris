@@ -32,6 +32,14 @@
 )]
 #[cfg_attr(any(target_board = "medusa-a"), path = "bsp/medusa_a.rs")]
 #[cfg_attr(any(target_board = "grapefruit"), path = "bsp/grapefruit.rs")]
+#[cfg_attr(
+    any(target_board = "minibar-a", target_board = "minibar-b"),
+    path = "bsp/minibar.rs"
+)]
+#[cfg_attr(
+    any(target_board = "cosmo-a", target_board = "cosmo-b"),
+    path = "bsp/cosmo_ab.rs"
+)]
 mod bsp;
 mod control;
 
@@ -65,13 +73,21 @@ impl From<usize> for Fan {
 task_slot!(I2C, i2c_driver);
 task_slot!(SENSOR, sensor);
 
-#[derive(Copy, Clone, Eq, PartialEq, counters::Count)]
+#[derive(Copy, Clone, PartialEq, counters::Count)]
 enum Trace {
     #[count(skip)]
     None,
     Start,
     ThermalMode(#[count(children)] ThermalMode),
     AutoState(#[count(children)] ThermalAutoState),
+    PowerDownDueTo {
+        sensor_id: SensorId,
+        temperature: units::Celsius,
+    },
+    CriticalDueTo {
+        sensor_id: SensorId,
+        temperature: units::Celsius,
+    },
     FanReadFailed(SensorId, SensorReadError),
     MiscReadFailed(SensorId, SensorReadError),
     SensorReadFailed(SensorId, SensorReadError),
@@ -163,27 +179,6 @@ impl<'a> idl::InOrderThermalImpl for ServerImpl<'a> {
             return Err(ThermalError::NotInAutoMode.into());
         }
         Ok(self.control.get_state())
-    }
-
-    fn set_fan_pwm(
-        &mut self,
-        _: &RecvMessage,
-        index: u8,
-        pwm: u8,
-    ) -> Result<(), RequestError<ThermalError>> {
-        if self.mode != ThermalMode::Manual {
-            return Err(ThermalError::NotInManualMode.into());
-        }
-        let pwm =
-            PWMDuty::try_from(pwm).map_err(|_| ThermalError::InvalidPWM)?;
-
-        if let Some(fan) = self.control.fan(index) {
-            self.control
-                .set_fan_pwm(fan, pwm)
-                .map_err(|_| ThermalError::DeviceError.into())
-        } else {
-            Err(ThermalError::InvalidFan.into())
-        }
     }
 
     fn set_mode_manual(
@@ -303,9 +298,9 @@ impl<'a> NotificationHandler for ServerImpl<'a> {
         notifications::TIMER_MASK
     }
 
-    fn handle_notification(&mut self, _bits: u32) {
+    fn handle_notification(&mut self, bits: userlib::NotificationBits) {
         let now = sys_get_timer().now;
-        if now >= self.deadline {
+        if bits.has_timer_fired(notifications::TIMER_MASK) {
             // See if any fans were removed or added since last iteration
             self.control.update_fan_presence();
 

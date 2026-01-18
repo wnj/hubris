@@ -6,7 +6,6 @@ stacksize = 1024
 image-names = ["a", "b"]
 epoch = 0
 version = 0
-fwid = true
 
 [kernel]
 name = "rot-carrier"
@@ -14,10 +13,9 @@ features = ["dice-self"]
 requires = {flash = 54176, ram = 3876}
 
 [caboose]
-tasks = ["caboose_reader", "sprot"]
+tasks = ["sprot"]
 region = "flash"
 size = 256
-default = true
 
 [tasks.jefe]
 name = "task-jefe"
@@ -29,12 +27,6 @@ notifications = ["fault", "timer"]
 
 [tasks.jefe.config.allowed-callers]
 request_reset = ["update_server"]
-
-[tasks.caboose_reader]
-name = "task-caboose-reader"
-priority = 2
-max-sizes = {flash = 16384, ram = 2048}
-start = true
 
 [tasks.idle]
 name = "task-idle"
@@ -102,7 +94,7 @@ priority = 5
 max-sizes = {flash = 16384, ram = 4096}
 uses = ["rng", "pmc"]
 start = true
-stacksize = 2200
+stacksize = 2216
 task-slots = ["syscon_driver"]
 
 [tasks.sprot]

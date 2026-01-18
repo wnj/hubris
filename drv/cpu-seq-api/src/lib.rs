@@ -9,7 +9,7 @@
 use counters::Count;
 use derive_idol_err::IdolError;
 use userlib::{sys_send, FromPrimitive};
-use zerocopy::AsBytes;
+use zerocopy::{Immutable, IntoBytes, KnownLayout};
 
 // Re-export PowerState for client convenience.
 pub use drv_cpu_power_state::PowerState;
@@ -32,7 +32,18 @@ pub enum SeqError {
     ServerRestarted,
 }
 
-#[derive(Copy, Clone, Debug, FromPrimitive, Eq, PartialEq, AsBytes, Count)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    FromPrimitive,
+    Eq,
+    PartialEq,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    Count,
+)]
 #[repr(u8)]
 pub enum StateChangeReason {
     /// No reason was provided.
@@ -60,11 +71,41 @@ pub enum StateChangeReason {
     HostReboot,
     /// The system powered off because a component has overheated.
     Overheat,
+    /// A0 MAPO fault from the sequencer
+    A0Mapo,
+    /// System Management Error
+    SmerrAssert,
+    /// The system powered off for reasons we can't explain
+    Unknown,
+}
+
+/// Indicates the result of a power state transition.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    FromPrimitive,
+    Eq,
+    PartialEq,
+    IntoBytes,
+    Immutable,
+    KnownLayout,
+    Count,
+)]
+#[repr(u8)]
+pub enum Transition {
+    /// The sequencer successfully transitioned to the desired state.
+    Changed,
+    /// The sequencer believes the system was already in the desired state, and
+    /// did not perform a state transition.
+    Unchanged,
 }
 
 // On Gimlet, we have two banks of up to 8 DIMMs apiece. Export the "two banks"
 // bit of knowledge here so it can be used by gimlet-seq-server, spd, and
 // packrat, all of which want to know at compile-time how many banks there are.
 pub const NUM_SPD_BANKS: usize = 2;
+
+use crate as drv_cpu_seq_api;
 
 include!(concat!(env!("OUT_DIR"), "/client_stub.rs"));

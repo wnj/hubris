@@ -1,2 +1,3 @@
-generated from [this commit](https://github.com/oxidecomputer/quartz/commit/e31772323d13f15802554ae3daa5061f9c9290cc)
-([this CI run](https://github.com/oxidecomputer/quartz/actions/runs/13228105732/job/36921564266))
+FPGA images and collateral are generated from:
+[this sha](https://github.com/oxidecomputer/quartz/commit/cd50a1785b4fcc075036f2ed0e1e8de6c8797122)
+[release](https://api.github.com/repos/oxidecomputer/quartz/releases/253414406)

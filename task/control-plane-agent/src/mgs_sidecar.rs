@@ -20,17 +20,18 @@ use gateway_messages::{
     EcdsaSha2Nistp256Challenge, IgnitionCommand, IgnitionState, MgsError,
     MgsRequest, MgsResponse, MonorailComponentAction,
     MonorailComponentActionResponse, MonorailError as GwMonorailError,
-    PowerState, RotBootInfo, RotRequest, RotResponse, SensorRequest,
-    SensorResponse, SpComponent, SpError, SpStateV2, SpUpdatePrepare,
-    UnlockChallenge, UnlockResponse, UpdateChunk, UpdateId, UpdateStatus,
+    PcieRegisterRead, PowerState, PowerStateTransition, RotBootInfo,
+    RotRequest, RotResponse, SensorRequest, SensorResponse, SpComponent,
+    SpError, SpStateV2, SpUpdatePrepare, UnlockChallenge, UnlockResponse,
+    UpdateChunk, UpdateId, UpdateStatus,
 };
 use host_sp_messages::HostStartupOptions;
 use idol_runtime::{Leased, RequestError};
 use ringbuf::{counted_ringbuf, ringbuf_entry, ringbuf_entry_root};
-use task_control_plane_agent_api::{ControlPlaneAgentError, VpdIdentity};
+use task_control_plane_agent_api::{ControlPlaneAgentError, OxideIdentity};
 use task_net_api::{MacAddress, UdpMetadata, VLanId};
 use userlib::sys_get_timer;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 // We're included under a special `path` cfg from main.rs, which confuses rustc
 // about where our submodules live. Pass explicit paths to correct it.
@@ -160,7 +161,7 @@ impl MgsHandler {
         }
     }
 
-    pub(crate) fn identity(&self) -> VpdIdentity {
+    pub(crate) fn identity(&self) -> OxideIdentity {
         self.common.identity()
     }
 
@@ -800,7 +801,7 @@ impl SpHandler for MgsHandler {
         &mut self,
         sender: Sender<VLanId>,
         power_state: PowerState,
-    ) -> Result<(), SpError> {
+    ) -> Result<PowerStateTransition, SpError> {
         ringbuf_entry_root!(
             CRITICAL,
             CriticalEvent::SetPowerState {
@@ -832,7 +833,11 @@ impl SpHandler for MgsHandler {
 
         self.sequencer
             .set_tofino_seq_policy(policy)
-            .map_err(|e| SpError::PowerStateError(e as u32))
+            .map_err(|e| SpError::PowerStateError(e as u32))?;
+
+        // TODO(eliza): this should probably also be made idempotent, à la the
+        // compute sled sequencer...
+        Ok(PowerStateTransition::Changed)
     }
 
     fn serial_console_attach(
@@ -907,6 +912,9 @@ impl SpHandler for MgsHandler {
 
         match component {
             SpComponent::MONORAIL => Ok(drv_monorail_api::PORT_COUNT as u32),
+            SpComponent::TOFINO => {
+                Ok(drv_sidecar_seq_api::TOFINO_DEBUG_REGS.len() as u32)
+            }
             _ => self.common.inventory().num_component_details(&component),
         }
     }
@@ -923,7 +931,45 @@ impl SpHandler for MgsHandler {
             SpComponent::MONORAIL => ComponentDetails::PortStatus(
                 monorail_port_status::port_status(&self.monorail, index),
             ),
-            _ => self.common.inventory().component_details(&component, index),
+            _ => self.common.inventory().component_details(
+                &component,
+                index,
+                |dev, index| match dev.component {
+                    SpComponent::TOFINO => {
+                        let bounded = if (index.0 as usize)
+                            > drv_sidecar_seq_api::TOFINO_DEBUG_REGS.len()
+                        {
+                            panic!(
+                                "index out bounds; this should be unreachable"
+                            );
+                        } else {
+                            index.0 as usize
+                        };
+
+                        let result = self.sequencer.tofino_read_direct(
+                            drv_sidecar_seq_api::TOFINO_DEBUG_REGS[bounded].0,
+                            drv_sidecar_seq_api::TOFINO_DEBUG_REGS[bounded]
+                                .1
+                                .into(),
+                        );
+
+                        ComponentDetails::Pcie(PcieRegisterRead {
+                            bar: drv_sidecar_seq_api::TOFINO_DEBUG_REGS
+                                [bounded]
+                                .0
+                                .into(),
+                            offset: drv_sidecar_seq_api::TOFINO_DEBUG_REGS
+                                [bounded]
+                                .1
+                                .into(),
+                            reg_result: result.map_err(|e| e.into()),
+                        })
+                    }
+                    _ => {
+                        panic!("unknown component");
+                    }
+                },
+            ),
         }
     }
 
@@ -954,6 +1000,17 @@ impl SpHandler for MgsHandler {
 
         self.common
             .component_set_active_slot(component, slot, persist)
+    }
+
+    fn component_get_persistent_slot(
+        &mut self,
+        component: SpComponent,
+    ) -> Result<u16, SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::ComponentGetPersistentSlot { component }
+        ));
+
+        self.common.component_get_persistent_slot(component)
     }
 
     fn component_clear_status(
@@ -1069,7 +1126,15 @@ impl SpHandler for MgsHandler {
         &mut self,
         component: SpComponent,
     ) -> Result<(), SpError> {
-        self.common.reset_component_trigger(component)
+        match component {
+            SpComponent::MONORAIL => {
+                self.common.reset_component_trigger_check(component)?;
+                self.monorail
+                    .reinit()
+                    .map_err(|e| SpError::ComponentOperationFailed(e as u32))
+            }
+            _ => self.common.reset_component_trigger(component),
+        }
     }
 
     fn read_sensor(
@@ -1148,6 +1213,33 @@ impl SpHandler for MgsHandler {
     ) -> Result<Option<DumpSegment>, SpError> {
         self.common.task_dump_read_continue(key, seq, buf)
     }
+
+    fn read_host_flash(
+        &mut self,
+        _slot: u16,
+        _addr: u32,
+        _buf: &mut [u8],
+    ) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::ReadHostFlash {
+            addr: 0
+        }));
+
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn start_host_flash_hash(&mut self, _slot: u16) -> Result<(), SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::StartHostFlashHash {
+            slot: 0
+        }));
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn get_host_flash_hash(&mut self, _slot: u16) -> Result<[u8; 32], SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetHostFlashHash {
+            slot: 0
+        }));
+        Err(SpError::RequestUnsupportedForSp)
+    }
 }
 
 // Helper function for `.map_err()`; we can't use `?` because we can't implement
@@ -1179,13 +1271,13 @@ fn get_ecdsa_challenge() -> Result<EcdsaSha2Nistp256Challenge, SpError> {
     let packrat = task_packrat_api::Packrat::from(
         crate::mgs_common::PACKRAT.get_task_id(),
     );
-    let identity = packrat.get_identity().unwrap_or(VpdIdentity::default());
+    let identity = packrat.get_identity().unwrap_or(OxideIdentity::default());
     const HW_ID_LEN: usize = 32;
     let mut hw_id = [0u8; HW_ID_LEN];
     static_assertions::const_assert!(
-        HW_ID_LEN >= core::mem::size_of::<VpdIdentity>()
+        HW_ID_LEN >= core::mem::size_of::<OxideIdentity>()
     );
-    hw_id[..core::mem::size_of::<VpdIdentity>()]
+    hw_id[..core::mem::size_of::<OxideIdentity>()]
         .copy_from_slice(identity.as_bytes());
 
     let now = sys_get_timer().now;

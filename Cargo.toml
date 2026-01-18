@@ -20,6 +20,21 @@ opt-level = "z" # smaller optimizations
 [profile.dev]
 opt-level = 1 # no optimizations was just too painful in terms of flash size
 
+[profile.release.package.endoscope]
+codegen-units = 1
+debug = 2
+opt-level = "z"
+
+[profile.dev.package.endoscope]
+codegen-units = 1
+debug = 2
+opt-level = "z"
+
+[profile.bench.package.endoscope]
+codegen-units = 1
+debug = 2
+opt-level = "z"
+
 [patch."https://github.com/oxidecomputer/hubris".userlib]
 path = "sys/userlib"
 
@@ -77,6 +92,8 @@ leb128 = { version = "0.2.5", default-features = false }
 lpc55-pac = { version = "0.4", default-features = false }
 memchr = { version = "2.4", default-features = false }
 memoffset = { version = "0.6.5", default-features = false }
+minicbor = { version = "2.1.1", default-features = false }
+minicbor-serde = { version = "0.6.0", default-features = false }
 multimap = { version = "0.8.3", default-features = false }
 nb = { version = "1", default-features = false }
 num = { version = "0.4", default-features = false }
@@ -88,6 +105,8 @@ paste = { version = "1", default-features = false }
 path-slash = { version = "0.1.3", default-features = false }
 prettyplease = { version = "0.2.29", default-features = false }
 proc-macro2 = { version = "1", default-features = false }
+proptest = { version = "1.8.0" }
+proptest-derive = { version = "0.6.0" }
 quote = { version = "1", default-features = false }
 rand = { version = "0.8", default-features = false }
 rand_chacha = { version = "0.3", default-features = false }
@@ -106,7 +125,7 @@ sha2 = { version = "0.10", default-features = false }
 sha3 = { version = "0.10", default-features = false }
 smbus-pec = { version = "1.0.1", default-features = false }
 smoltcp = { version = "0.9", default-features = false, features = ["proto-ipv6", "medium-ethernet", "socket-udp", "async"] }
-ssh-key = { version = "0.6.6", default-features = false, features = ["std", "p256"] }
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "p256"] }
 spin = { version = "0.9.4", default-features = false, features = ["mutex", "spin_mutex"]}
 ssmarshal = { version = "1.0.0", default-features = false }
 static_assertions = { version = "1", default-features = false }
@@ -115,19 +134,22 @@ stm32f4 = { version = "0.13.0", default-features = false }
 stm32h7 = { version = "0.14", default-features = false }
 stm32g0 = { version = "0.15.1", default-features = false }
 strsim = { version = "0.10.0", default-features = false }
-syn = { version = "2", default-features = false, features = ["derive", "parsing", "proc-macro", "extra-traits", "full"] }
-toml = { version = "0.7", default-features = false, features = ["parse", "display"] }
-toml_edit = { version = "0.19", default-features = false }
+syn = { version = "2", default-features = false, features = ["derive", "parsing", "proc-macro", "extra-traits", "full", "printing"] }
+toml = { version = "0.9.6", default-features = false, features = ["parse", "display", "serde", "preserve_order"] }
+toml_edit = { version = "0.23.5", default-features = false, features = ["parse", "display"] }
 vcell = { version = "0.1.2", default-features = false }
 walkdir = { version = "2.0.0", default-features = false }
-zerocopy = { version = "0.6.1", default-features = false }
+zerocopy = { version = "0.8.25", default-features = false }
+zerocopy-derive = { version = "0.8.25", default-features = false }
 zeroize = { version = "1.5.7", default-features = false, features = ["zeroize_derive"] }
 zip = { version = "0.6", default-features = false, features = ["bzip2", "deflate", "zstd"] }
 
 # Oxide forks and repos
+apob = { git = "https://github.com/oxidecomputer/apob", default-features = false }
 attest-data = { git = "https://github.com/oxidecomputer/dice-util", default-features = false, version = "0.4.0" }
 dice-mfg-msgs = { git = "https://github.com/oxidecomputer/dice-util", default-features = false, version = "0.2.1" }
 gateway-messages = { git = "https://github.com/oxidecomputer/management-gateway-service", default-features = false, features = ["smoltcp"] }
+gateway-ereport-messages = { git = "https://github.com/oxidecomputer/management-gateway-service", default-features = false }
 gimlet-inspector-protocol = { git = "https://github.com/oxidecomputer/gimlet-inspector-protocol", version = "0.1.0" }
 hif = { git = "https://github.com/oxidecomputer/hif", default-features = false }
 humpty = { git = "https://github.com/oxidecomputer/humpty", default-features = false, version = "0.1.3" }
@@ -135,6 +157,7 @@ hubtools = { git = "https://github.com/oxidecomputer/hubtools", default-features
 idol = { git = "https://github.com/oxidecomputer/idolatry.git", default-features = false }
 idol-runtime = { git = "https://github.com/oxidecomputer/idolatry.git", default-features = false }
 lpc55_sign = { git = "https://github.com/oxidecomputer/lpc55_support", default-features = false }
+measurement-token = { git = "https://github.com/oxidecomputer/lpc55_support", default-features = false }
 ordered-toml = { git = "https://github.com/oxidecomputer/ordered-toml", default-features = false }
 pmbus = { git = "https://github.com/oxidecomputer/pmbus", default-features = false }
 salty = { version = "0.3", default-features = false }
@@ -143,6 +166,10 @@ tlvc = { git = "https://github.com/oxidecomputer/tlvc", default-features = false
 tlvc-text = { git = "https://github.com/oxidecomputer/tlvc", default-features = false, version = "0.3.0" }
 transceiver-messages = { git = "https://github.com/oxidecomputer/transceiver-control/", default-features = false }
 vsc7448-pac = { git = "https://github.com/oxidecomputer/vsc7448", default-features = false }
+
+[patch.crates-io]
+# See https://gitlab.com/robigalia/ssmarshal/-/merge_requests/2
+ssmarshal = { git = "https://gitlab.com/de-vri-es/ssmarshal", rev = "10e90cbe389c8f07c52815857551a051946881ab" }
 
 [workspace.lints.rust]
 elided_lifetimes_in_paths = "warn"

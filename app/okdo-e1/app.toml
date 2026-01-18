@@ -4,12 +4,11 @@ board = "okdo-e1"
 chip = "../../chips/lpc55"
 stacksize = 1024
 image-names = ["a", "b"]
-fwid = true
 
 [kernel]
 name = "okdo-e1"
 features = ["dump", "dice-self"]
-requires = { flash = 55040, ram = 4096 }
+requires = { flash = 55040, ram = 3376 }
 
 [caboose]
 region = "flash"
@@ -19,10 +18,10 @@ default = true
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = { flash = 16384, ram = 2048 }
+max-sizes = { flash = 16384, ram = 4096 }
 start = true
 features = ["dump"]
-stacksize = 1536
+stacksize = 2000
 notifications = ["fault", "timer"]
 extern-regions = ["sram2"]
 
@@ -116,7 +115,7 @@ priority = 3
 max-sizes = { flash = 16384, ram = 4096 }
 uses = ["rng", "pmc"]
 start = true
-stacksize = 2200
+stacksize = 2216
 task-slots = ["syscon_driver"]
 
 [tasks.pong]

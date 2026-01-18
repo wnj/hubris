@@ -2,6 +2,7 @@ name = "demo-stm32h753-nucleo"
 target = "thumbv7em-none-eabihf"
 board = "nucleo-h753zi"
 chip = "../../chips/stm32h7"
+memory = "memory-large.toml"
 stacksize = 896
 
 [kernel]
@@ -12,10 +13,10 @@ features = ["h753", "dump"]
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = {flash = 16384, ram = 2048}
+max-sizes = {flash = 16384, ram = 4096}
 start = true
 features = ["dump"]
-stacksize = 1536
+stacksize = 2000
 notifications = ["fault", "timer"]
 extern-regions = [ "sram1", "sram2", "sram3", "sram4" ]
 
@@ -70,7 +71,6 @@ task-slots = ["sys"]
 [tasks.packrat]
 name = "task-packrat"
 priority = 2
-max-sizes = {flash = 8192, ram = 2048}
 start = true
 # task-slots is explicitly empty: packrat should not send IPCs!
 task-slots = []
@@ -147,15 +147,15 @@ notifications = ["socket"]
 
 [tasks.hiffy]
 name = "task-hiffy"
-features = ["h753", "stm32h7", "i2c", "gpio", "spi", "qspi", "hash"]
+features = ["h753", "stm32h7", "i2c", "gpio", "spi", "qspi", "hash", "turbo"]
 priority = 5
-max-sizes = {flash = 32768, ram = 32768 }
+max-sizes = {flash = 32768, ram = 65536 }
 stacksize = 2048
 start = true
 task-slots = ["sys", "i2c_driver", "hf", "hash_driver"]
 
 [tasks.hf]
-name = "drv-gimlet-hf-server"
+name = "drv-mock-gimlet-hf-server"
 features = ["h753", "hash"]
 priority = 4
 max-sizes = {flash = 16384, ram = 4096 }

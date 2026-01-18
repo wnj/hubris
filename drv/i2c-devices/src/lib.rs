@@ -6,13 +6,14 @@
 //!
 //! This crate contains (generally) all I2C device drivers, including:
 //!
-//! - [`adm1272`]: ADM1272 hot swap controller
+//! - [`adm127x`]: ADM1272 or ADM1273 hot swap controller
 //! - [`adt7420`]: ADT7420 temperature sensor
 //! - [`at24csw080`]: AT24CSW080 serial EEPROM
 //! - [`ds2482`]: DS2482-100 1-wire initiator
 //! - [`emc2305`]: EMC2305 fan driver
 //! - [`isl68224`]: ISL68224 power controller
 //! - [`lm5066`]: LM5066 hot swap controller
+//! - [`lm5066i`]: LM5066I hot swap controller
 //! - [`ltc4282`]: LTC4282 high current hot swap controller
 //! - [`m24c02`]: M24C02 EEPROM, used in MWOCP68 power shelf
 //! - [`m2_hp_only`]: M.2 drive; identical to `nvme_bmc`, with the limitation
@@ -43,21 +44,19 @@ use pmbus::commands::CommandCode;
 
 macro_rules! pmbus_read {
     ($device:expr, $cmd:ident) => {
-        match $cmd::CommandData::from_slice(&match $device
+        $device
             .read_reg::<u8, [u8; $cmd::CommandData::len()]>(
                 $cmd::CommandData::code(),
-            ) {
-            Ok(rval) => Ok(rval),
-            Err(code) => Err(Error::BadRead {
+            )
+            .map_err(|code| Error::BadRead {
                 cmd: $cmd::CommandData::code(),
                 code,
-            }),
-        }?) {
-            Some(data) => Ok(data),
-            None => Err(Error::BadData {
-                cmd: $cmd::CommandData::code(),
-            }),
-        }
+            })
+            .and_then(|rval| {
+                $cmd::CommandData::from_slice(&rval).ok_or(Error::BadData {
+                    cmd: $cmd::CommandData::code(),
+                })
+            })
     };
 
     ($device:expr, $dev:ident::$cmd:ident) => {{
@@ -67,26 +66,22 @@ macro_rules! pmbus_read {
 }
 
 macro_rules! pmbus_rail_read {
-    ($device:expr, $rail:expr, $cmd:ident) => {{
-        let payload = [PAGE::CommandData::code(), $rail];
-
-        match $cmd::CommandData::from_slice(&match $device
+    ($device:expr, $rail:expr, $cmd:ident) => {
+        $device
             .write_read_reg::<u8, [u8; $cmd::CommandData::len()]>(
                 $cmd::CommandData::code(),
-                &payload,
-            ) {
-            Ok(rval) => Ok(rval),
-            Err(code) => Err(Error::BadRead {
+                &[PAGE::CommandData::code(), $rail],
+            )
+            .map_err(|code| Error::BadRead {
                 cmd: $cmd::CommandData::code(),
                 code,
-            }),
-        }?) {
-            Some(data) => Ok(data),
-            None => Err(Error::BadData {
-                cmd: $cmd::CommandData::code(),
-            }),
-        }
-    }};
+            })
+            .and_then(|rval| {
+                $cmd::CommandData::from_slice(&rval).ok_or(Error::BadData {
+                    cmd: $cmd::CommandData::code(),
+                })
+            })
+    };
 
     ($device:expr, $rail:expr, $dev:ident::$cmd:ident) => {{
         use $dev::{$cmd, PAGE};
@@ -95,28 +90,23 @@ macro_rules! pmbus_rail_read {
 }
 
 macro_rules! pmbus_rail_phase_read {
-    ($device:expr, $rail:expr, $phase:expr, $cmd:ident) => {{
-        let rail_payload = [PAGE::CommandData::code(), $rail];
-        let phase_payload = [PHASE::CommandData::code(), $phase];
-
-        match $cmd::CommandData::from_slice(&match $device
+    ($device:expr, $rail:expr, $phase:expr, $cmd:ident) => {
+        $device
             .write_write_read_reg::<u8, [u8; $cmd::CommandData::len()]>(
                 $cmd::CommandData::code(),
-                &rail_payload,
-                &phase_payload,
-            ) {
-            Ok(rval) => Ok(rval),
-            Err(code) => Err(Error::BadRead {
+                &[PAGE::CommandData::code(), $rail],
+                &[PHASE::CommandData::code(), $phase],
+            )
+            .map_err(|code| Error::BadRead {
                 cmd: $cmd::CommandData::code(),
                 code,
-            }),
-        }?) {
-            Some(data) => Ok(data),
-            None => Err(Error::BadData {
-                cmd: $cmd::CommandData::code(),
-            }),
-        }
-    }};
+            })
+            .and_then(|rval| {
+                $cmd::CommandData::from_slice(&rval).ok_or(Error::BadData {
+                    cmd: $cmd::CommandData::code(),
+                })
+            })
+    };
 }
 
 macro_rules! pmbus_write {
@@ -232,7 +222,7 @@ pub trait Validate<T: core::convert::Into<drv_i2c_api::ResponseCode>> {
     }
 }
 
-pub mod adm1272;
+pub mod adm127x;
 pub mod adt7420;
 pub mod at24csw080;
 pub mod bmr491;
@@ -240,6 +230,7 @@ pub mod ds2482;
 pub mod emc2305;
 pub mod isl68224;
 pub mod lm5066;
+pub mod lm5066i;
 pub mod ltc4282;
 pub mod m24c02;
 pub mod m2_hp_only;

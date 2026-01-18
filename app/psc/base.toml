@@ -2,31 +2,33 @@ target = "thumbv7em-none-eabihf"
 chip = "../../chips/stm32h7"
 memory = "memory-large.toml"
 stacksize = 896
-fwid = true
 
 [kernel]
 name = "psc"
 requires = {flash = 32868, ram = 6000}
-features = ["dump"]
+features = ["dump", "measurement-handoff"]
+extern-regions = ["dtcm"]
 
 [caboose]
-tasks = ["control_plane_agent"]
+tasks = ["control_plane_agent", "packrat"]
 region = "flash"
 size = 256
-default = true
 
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
-max-sizes = {flash = 16384, ram = 2048}
+max-sizes = {flash = 16384, ram = 4096}
 start = true
-features = ["dump"]
-stacksize = 1536
+features = ["dump", "fault-counters"]
+stacksize = 2232
 notifications = ["fault", "timer"]
 extern-regions = ["sram1", "sram2", "sram3", "sram4"]
 
 [tasks.jefe.config.on-state-change]
 net = "jefe-state-change"
+
+[tasks.jefe.config.on-task-fault]
+packrat = "task-faulted"
 
 [tasks.jefe.config.allowed-callers]
 set_reset_reason = ["sys"]
@@ -91,6 +93,14 @@ owner = {name = "sequencer", notification = "psu_pwr_ok_6"}
 
 
 
+[tasks.rng_driver]
+features = ["h753", "ereport"]
+name = "drv-stm32h7-rng"
+priority = 6
+uses = ["rng"]
+start = true
+stacksize = 512
+task-slots = ["sys", "packrat"]
 
 [tasks.i2c_driver]
 name = "drv-stm32xx-i2c-server"
@@ -110,11 +120,12 @@ notifications = ["i2c2-irq", "i2c3-irq"]
 
 [tasks.packrat]
 name = "task-packrat"
-priority = 3
-max-sizes = {flash = 8192, ram = 2048}
+priority = 1
+stacksize = 1336
 start = true
-# task-slots is explicitly empty: packrat should not send IPCs!
-task-slots = []
+task-slots = ["jefe"]
+features = ["ereport"]
+notifications = ["task-faulted"]
 
 [tasks.sequencer]
 name = "drv-psc-seq-server"
@@ -145,9 +156,9 @@ notifications = ["flash-irq"]
 
 [tasks.hiffy]
 name = "task-hiffy"
-features = ["h753", "stm32h7", "i2c", "gpio", "sprot"]
+features = ["h753", "stm32h7", "i2c", "gpio", "sprot", "turbo"]
 priority = 5
-max-sizes = {flash = 32768, ram = 16384 }
+max-sizes = {flash = 32768}
 stacksize = 1200
 start = true
 task-slots = ["sys", "i2c_driver", "sprot"]
@@ -192,13 +203,10 @@ stacksize = 872
 task-slots = ["sys"]
 notifications = ["spi-irq"]
 
-
 [tasks.control_plane_agent]
 name = "task-control-plane-agent"
 priority = 6
-max-sizes = {flash = 131072, ram = 32768}
-# This is probably a bit overkill and can be tuned later
-stacksize = 6000
+stacksize = 7000
 start = true
 uses = []
 task-slots = [
@@ -317,6 +325,17 @@ extern-regions = [ "sram1", "sram2", "sram3", "sram4" ]
 notifications = ["socket"]
 features = ["net", "vlan"]
 
+[tasks.snitch]
+name = "task-snitch"
+# The snitch should have a priority immediately below that of the net task,
+# to minimize the number of components that can starve it from resources.
+priority = 5
+stacksize = 1200
+start = true
+task-slots = ["net", "packrat"]
+features = ["vlan"]
+notifications = ["socket"]
+
 [tasks.idle]
 name = "task-idle"
 priority = 7
@@ -382,6 +401,7 @@ name = "psu0eeprom"
 address = 0b1010_000
 device = "m24c02"
 description = "PSU 0 EEPROM"
+refdes = ["PSU0", "ID"]
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -391,6 +411,7 @@ device = "mwocp68"
 description = "PSU 0 MCU"
 power = { rails = [ "V54_PSU0", "V12_PSU0" ], sensors = ["voltage", "current", "input-voltage", "input-current"] }
 sensors = { input-voltage = 2, input-current = 2, voltage = 2, current = 2, temperature = 3, speed = 2 }
+refdes = "PSU0"
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -398,6 +419,7 @@ name = "psu1eeprom"
 address = 0b1010_001
 device = "m24c02"
 description = "PSU 1 EEPROM"
+refdes = ["PSU1", "ID"]
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -407,6 +429,7 @@ device = "mwocp68"
 description = "PSU 1 MCU"
 power = { rails = [ "V54_PSU1", "V12_PSU1" ], sensors = ["voltage", "current", "input-voltage", "input-current"] }
 sensors = { input-voltage = 2, input-current = 2, voltage = 2, current = 2, temperature = 3, speed = 2 }
+refdes = "PSU1"
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -414,6 +437,7 @@ name = "psu2eeprom"
 address = 0b1010_010
 device = "m24c02"
 description = "PSU 2 EEPROM"
+refdes = ["PSU2", "ID"]
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -423,6 +447,7 @@ device = "mwocp68"
 description = "PSU 2 MCU"
 power = { rails = [ "V54_PSU2", "V12_PSU2" ], sensors = ["voltage", "current", "input-voltage", "input-current"] }
 sensors = { input-voltage = 2, input-current = 2, voltage = 2, current = 2, temperature = 3, speed = 2 }
+refdes = "PSU2"
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -430,6 +455,7 @@ name = "psu3eeprom"
 address = 0b1010_011
 device = "m24c02"
 description = "PSU 3 EEPROM"
+refdes = ["PSU3", "ID"]
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -439,6 +465,7 @@ device = "mwocp68"
 description = "PSU 3 MCU"
 power = { rails = [ "V54_PSU3", "V12_PSU3" ], sensors = ["voltage", "current", "input-voltage", "input-current"] }
 sensors = { input-voltage = 2, input-current = 2, voltage = 2, current = 2, temperature = 3, speed = 2 }
+refdes = "PSU3"
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -446,6 +473,7 @@ name = "psu4eeprom"
 address = 0b1010_100
 device = "m24c02"
 description = "PSU 4 EEPROM"
+refdes = ["PSU4", "ID"]
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -455,6 +483,7 @@ device = "mwocp68"
 description = "PSU 4 MCU"
 power = { rails = [ "V54_PSU4", "V12_PSU4" ], sensors = ["voltage", "current", "input-voltage", "input-current"] }
 sensors = { input-voltage = 2, input-current = 2, voltage = 2, current = 2, temperature = 3, speed = 2 }
+refdes = "PSU4"
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -462,6 +491,7 @@ name = "psu5eeprom"
 address = 0b1010_101
 device = "m24c02"
 description = "PSU 5 EEPROM"
+refdes = ["PSU5", "ID"]
 
 [[config.i2c.devices]]
 bus = "backplane"
@@ -471,6 +501,7 @@ device = "mwocp68"
 description = "PSU 5 MCU"
 power = { rails = [ "V54_PSU5", "V12_PSU5" ], sensors = ["voltage", "current", "input-voltage", "input-current"] }
 sensors = { input-voltage = 2, input-current = 2, voltage = 2, current = 2, temperature = 3, speed = 2 }
+refdes = "PSU5"
 
 [config.spi.spi2]
 controller = 2
@@ -539,3 +570,12 @@ owner = {name = "dump_agent", notification = "socket"}
 port = 11113
 tx = { packets = 3, bytes = 1024 }
 rx = { packets = 3, bytes = 1024 }
+
+[config.net.sockets.ereport]
+kind = "udp"
+owner = {name = "snitch", notification = "socket"}
+port = 57005
+tx = { packets = 3, bytes = 1024 }
+# v0 ereport requests are always 35B, so just make the buffer exactly
+# that size...
+rx = { packets = 3, bytes = 35 }

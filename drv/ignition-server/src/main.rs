@@ -10,7 +10,7 @@
 use drv_ignition_api::*;
 use drv_sidecar_mainboard_controller::ignition::*;
 use ringbuf::*;
-use userlib::{hl, sys_get_timer, sys_set_timer, task_slot, UnwrapLite};
+use userlib::{sys_get_timer, sys_set_timer, task_slot, UnwrapLite};
 
 task_slot!(FPGA, fpga);
 #[cfg(feature = "sequencer")]
@@ -58,7 +58,7 @@ fn main() -> ! {
         // ready.
         ringbuf_entry!(Trace::AwaitingMainboardControllerReady);
         while !sequencer.mainboard_controller_ready().unwrap_or(false) {
-            hl::sleep_for(25);
+            userlib::hl::sleep_for(25);
         }
     }
 
@@ -420,8 +420,13 @@ impl idol_runtime::NotificationHandler for ServerImpl {
         notifications::TIMER_MASK
     }
 
-    fn handle_notification(&mut self, _bits: u32) {
-        let start = sys_get_timer().now;
+    fn handle_notification(&mut self, _bits: userlib::NotificationBits) {
+        let timer = sys_get_timer();
+        if timer.deadline.is_some() {
+            return;
+        }
+
+        let start = timer.now;
 
         // Only poll the presence summary if the port count seems reasonable. A
         // count of 0xff may occur if the FPGA is running an incorrect

@@ -6,7 +6,7 @@
 
 use core::marker::PhantomData;
 use core::ops::Range;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 use crate::err::InteractFault;
 use crate::task::Task;
@@ -65,7 +65,7 @@ impl<T> USlice<T> {
         uassert!(core::mem::size_of::<T>() != 0);
 
         // Alignment check:
-        if base_address % core::mem::align_of::<T>() != 0 {
+        if !base_address.is_multiple_of(core::mem::align_of::<T>()) {
             return Err(UsageError::InvalidSlice);
         }
         // Check that a slice of `length` `T`s can even exist starting at
@@ -187,7 +187,7 @@ impl<T> USlice<T> {
 
 impl<T> USlice<T>
 where
-    T: FromBytes,
+    T: FromBytes + Immutable + KnownLayout,
 {
     /// Converts this into an _actual_ slice that can be directly read by the
     /// kernel.
@@ -203,7 +203,7 @@ where
     /// 1. That the memory region this `USlice` describes is actual memory.
     /// 2. That this memory is legally readable by whatever task you're doing
     ///    work on behalf of.
-    /// 3. That it contains bytes that are valid `T`s. (The `FromBytes`
+    /// 3. That it contains bytes that are valid `T`s. (The `FromBytes, Immutable, KnownLayout`
     ///    constraint ensures this statically.)
     /// 4. That it does not alias any slice you intend to `&mut`-reference with
     ///    `assume_writable`, or any kernel memory.
@@ -232,7 +232,7 @@ where
     /// 1. That the memory region this `USlice` describes is actual memory.
     /// 2. That this memory is legally writable by whatever task you're doing
     ///    work on behalf of.
-    /// 3. That it contains bytes that are valid `T`s. (The `FromBytes`
+    /// 3. That it contains bytes that are valid `T`s. (The `FromBytes, Immutable, KnownLayout`
     ///    constraint ensures this statically.)
     /// 4. That it does not alias any other slice you intend to access, or any
     ///    kernel memory.
@@ -261,7 +261,7 @@ where
     /// 1. That the memory region this `USlice` describes is actual memory.
     /// 2. That this memory is legally readable by whatever task you're doing
     ///    work on behalf of.
-    /// 3. That it contains bytes that are valid `T`s. (The `FromBytes`
+    /// 3. That it contains bytes that are valid `T`s. (The `FromBytes, Immutable, KnownLayout`
     ///    constraint ensures this statically.)
     /// 4. That it does not alias any slice you intend to `&mut`-reference with
     ///    `assume_writable`, or any kernel memory.

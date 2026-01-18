@@ -16,6 +16,7 @@ use zerocopy::FromBytes;
 
 #[derive(Copy, Clone, PartialEq)]
 enum Trace {
+    None,
     DumpInitiated(u32),
     SetupFailed(SpCtrlError),
     DumpHeader([u8; 4]),
@@ -33,7 +34,6 @@ enum Trace {
     ReinitFailed,
     ReinitSucceededButResumeFailed,
     ReinitResumed,
-    None,
 }
 
 task_slot!(SP_CTRL, swd);
@@ -71,8 +71,8 @@ impl idl::InOrderDumperImpl for ServerImpl {
         }
 
         let header = match humpty::DumpAreaHeader::read_from_prefix(&buf[..]) {
-            Some(header) => header,
-            None => {
+            Ok((header, _)) => header,
+            Err(_) => {
                 return Err(DumperError::BadDumpAreaHeader.into());
             }
         };
@@ -188,7 +188,7 @@ impl NotificationHandler for ServerImpl {
         0
     }
 
-    fn handle_notification(&mut self, _bits: u32) {
+    fn handle_notification(&mut self, _bits: NotificationBits) {
         unreachable!()
     }
 }

@@ -9,7 +9,7 @@
 
 use ringbuf::*;
 use userlib::{task_slot, RecvMessage, TaskId};
-use zerocopy::{byteorder, AsBytes, Unaligned, U16};
+use zerocopy::{byteorder, Immutable, IntoBytes, KnownLayout, Unaligned, U16};
 
 use drv_fpga_api::{BitstreamType, DeviceState, FpgaError, ReadOp, WriteOp};
 use drv_fpga_devices::{ecp5, Fpga, FpgaBitstream, FpgaUserDesign};
@@ -151,6 +151,25 @@ fn main() -> ! {
             driver.configure_gpio();
 
             let devices = [ecp5::Ecp5::new(driver)];
+        } else if #[cfg(any(target_board = "minibar-a", target_board = "minibar-b"))] {
+            let configuration_port =
+                spi.device(drv_spi_api::devices::ECP5_FPGA);
+            let user_design =
+                spi.device(drv_spi_api::devices::ECP5_USER_DESIGN);
+
+            let driver = drv_fpga_devices::ecp5_spi::Ecp5UsingSpi {
+                sys,
+                done: sys_api::Port::J.pin(14),
+                init_n: sys_api::Port::J.pin(12),
+                program_n: sys_api::Port::J.pin(13),
+                configuration_port,
+                user_design,
+                user_design_reset_n: sys_api::Port::J.pin(15),
+                user_design_reset_duration: ecp5::USER_DESIGN_RESET_DURATION,
+            };
+            driver.configure_gpio();
+
+            let devices = [ecp5::Ecp5::new(driver)];
         } else {
             compile_error!("Board is not supported by drv/fpga-server");
         }
@@ -240,7 +259,7 @@ impl<'a, Device: Fpga<'a> + FpgaUserDesign> ServerImpl<'a, Device> {
     ) -> Result<UserDesignLock<'a, Device>, FpgaError> {
         let device = self.check_lock_and_get_device(caller, device_index)?;
 
-        device.user_design_lock().map_err(FpgaError::from)?;
+        device.user_design_lock()?;
         Ok(UserDesignLock(device))
     }
 }
@@ -487,16 +506,12 @@ impl<'a, Device: Fpga<'a> + FpgaUserDesign> idl::InOrderFpgaImpl
         // Released on function exit.
         let lock = self.lock_user_design(msg.sender, device_index)?;
 
-        lock.0
-            .user_design_write(header.as_bytes())
-            .map_err(FpgaError::from)?;
+        lock.0.user_design_write(header.as_bytes())?;
 
         let mut index = 0;
         while index < data.len() {
             let chunk_size = (data.len() - index).min(self.buffer.len());
-            lock.0
-                .user_design_read(&mut self.buffer[..chunk_size])
-                .map_err(FpgaError::from)?;
+            lock.0.user_design_read(&mut self.buffer[..chunk_size])?;
 
             data.write_range(
                 index..(index + chunk_size),
@@ -525,9 +540,7 @@ impl<'a, Device: Fpga<'a> + FpgaUserDesign> idl::InOrderFpgaImpl
         // Released on function exit.
         let lock = self.lock_user_design(msg.sender, device_index)?;
 
-        lock.0
-            .user_design_write(header.as_bytes())
-            .map_err(FpgaError::from)?;
+        lock.0.user_design_write(header.as_bytes())?;
 
         let mut index = 0;
         while index < data.len() {
@@ -537,9 +550,7 @@ impl<'a, Device: Fpga<'a> + FpgaUserDesign> idl::InOrderFpgaImpl
                 &mut self.buffer[..chunk_size],
             )
             .map_err(|_| RequestError::Fail(ClientError::WentAway))?;
-            lock.0
-                .user_design_write(&self.buffer[..chunk_size])
-                .map_err(FpgaError::from)?;
+            lock.0.user_design_write(&self.buffer[..chunk_size])?;
             index += chunk_size;
         }
 
@@ -560,12 +571,8 @@ impl<'a, Device: Fpga<'a> + FpgaUserDesign> idl::InOrderFpgaImpl
         // Released on function exit.
         let lock = self.lock_user_design(msg.sender, device_index)?;
 
-        lock.0
-            .user_design_write(header.as_bytes())
-            .map_err(FpgaError::from)?;
-        lock.0
-            .user_design_read(&mut self.buffer[..1])
-            .map_err(FpgaError::from)?;
+        lock.0.user_design_write(header.as_bytes())?;
+        lock.0.user_design_read(&mut self.buffer[..1])?;
 
         Ok(self.buffer[0])
     }
@@ -586,12 +593,8 @@ impl<'a, Device: Fpga<'a> + FpgaUserDesign> idl::InOrderFpgaImpl
         // Released on function exit.
         let lock = self.lock_user_design(msg.sender, device_index)?;
 
-        lock.0
-            .user_design_write(header.as_bytes())
-            .map_err(FpgaError::from)?;
-        lock.0
-            .user_design_write(value.as_bytes())
-            .map_err(FpgaError::from)?;
+        lock.0.user_design_write(header.as_bytes())?;
+        lock.0.user_design_write(value.as_bytes())?;
 
         Ok(())
     }
@@ -605,12 +608,12 @@ impl<'a, Device: Fpga<'a> + FpgaUserDesign> idol_runtime::NotificationHandler
         0
     }
 
-    fn handle_notification(&mut self, _bits: u32) {
+    fn handle_notification(&mut self, _bits: userlib::NotificationBits) {
         unreachable!()
     }
 }
 
-#[derive(AsBytes, Unaligned)]
+#[derive(IntoBytes, Immutable, KnownLayout, Unaligned)]
 #[repr(C)]
 struct UserDesignRequestHeader {
     cmd: u8,
