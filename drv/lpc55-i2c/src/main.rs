@@ -149,29 +149,35 @@ fn muck_with_gpios(syscon: &Syscon) {
     // maddening so just muck with IOCON manually for now
 
     let gpio_driver = GPIO.get_task_id();
+
+    #[cfg(not(target_board = "micromod-28"))]
     let iocon = Pins::from(gpio_driver);
 
-    iocon.iocon_configure(
-        Pin::PIO1_21,
-        AltFn::Alt5,
-        Mode::NoPull,
-        Slew::Standard,
-        Invert::Disable,
-        Digimode::Digital,
-        Opendrain::Normal,
-        None,
-    );
+    cfg_if::cfg_if! {
+        if #[cfg(not(target_board = "micromod-28"))] {
+                iocon.iocon_configure(
+                Pin::PIO1_21,
+                AltFn::Alt5,
+                Mode::NoPull,
+                Slew::Standard,
+                Invert::Disable,
+                Digimode::Digital,
+                Opendrain::Normal,
+                None,
+            );
 
-    iocon.iocon_configure(
-        Pin::PIO1_20,
-        AltFn::Alt5,
-        Mode::NoPull,
-        Slew::Standard,
-        Invert::Disable,
-        Digimode::Digital,
-        Opendrain::Normal,
-        None,
-    );
+            iocon.iocon_configure(
+                Pin::PIO1_20,
+                AltFn::Alt5,
+                Mode::NoPull,
+                Slew::Standard,
+                Invert::Disable,
+                Digimode::Digital,
+                Opendrain::Normal,
+                None,
+            );
+        }
+    }
 }
 
 fn write_a_buffer(

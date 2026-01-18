@@ -7,12 +7,14 @@ edition = "2021"
 lpc55-pac = { workspace = true }
 num-traits = { workspace = true }
 zerocopy = { workspace = true }
+cfg-if.workspace = true
 
 drv-lpc55-gpio-api = { path = "../lpc55-gpio-api" }
 drv-lpc55-syscon-api = { path = "../lpc55-syscon-api" }
 userlib = { path = "../../sys/userlib", features = ["panic-messages"] }
 
 [build-dependencies]
+build-util.path = "../../build/util"
 idol = { workspace = true }
 
 [features]

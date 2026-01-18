@@ -102,7 +102,14 @@ cfg_if::cfg_if! {
                     One = 1,
                     Two = 2,
                 }
-            } else {
+            }
+            else if #[cfg(any(target_board = "micromod-69", target_board = "micromod-28"))] {
+                    #[derive(enum_map::Enum, Copy, Clone, FromPrimitive)]
+                    enum Led {
+                        Zero = 0,
+                    }
+            }
+            else {
                 #[derive(enum_map::Enum, Copy, Clone, FromPrimitive)]
                 enum Led {
                     Zero = 0,
@@ -617,6 +624,12 @@ cfg_if::cfg_if! {
                 // OKdo E1 is active low (RGB) LEDs
                 const LED_OFF_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::One;
                 const LED_ON_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::Zero;
+            } else if #[cfg(any(target_board = "micromod-69", target_board = "micromod-28"))] {
+                const LED_ZERO_PIN: drv_lpc55_gpio_api::Pin = drv_lpc55_gpio_api::Pin::PIO0_28; // Red?
+
+                // micromod-69 is active high LED
+                const LED_OFF_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::Zero;
+                const LED_ON_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::One;
             } else {
                 compile_error!("no LED mapping for unknown board");
             }
@@ -632,6 +645,10 @@ const fn led_gpio_num(led: Led) -> drv_lpc55_gpio_api::Pin {
                 Led::Zero => LED_ZERO_PIN,
                 Led::One => LED_ONE_PIN,
                 Led::Two => LED_TWO_PIN,
+            }
+        } else if #[cfg(any(target_board = "micromod-69", target_board = "micromod-28"))] {
+            match led {
+                Led::Zero => LED_ZERO_PIN,
             }
         } else {
             match led {
@@ -660,16 +677,20 @@ fn enable_led_pins() {
         None,
     );
 
-    gpio_driver.iocon_configure(
-        LED_ONE_PIN,
-        AltFn::Alt0,
-        Mode::NoPull,
-        Slew::Standard,
-        Invert::Disable,
-        Digimode::Digital,
-        Opendrain::Normal,
-        None,
-    );
+    cfg_if::cfg_if! {
+        if #[cfg(not(any(target_board = "micromod-69", target_board = "micromod-28")))] {
+            gpio_driver.iocon_configure(
+                LED_ONE_PIN,
+                AltFn::Alt0,
+                Mode::NoPull,
+                Slew::Standard,
+                Invert::Disable,
+                Digimode::Digital,
+                Opendrain::Normal,
+                None,
+            );
+        }
+    }
 
     cfg_if::cfg_if! {
         if #[cfg(target_board = "okdo-e1")] {
@@ -689,7 +710,12 @@ fn enable_led_pins() {
     // Both LEDs are active low -- so they will light when we set the
     // direction of the pin if we don't explicitly turn them off first
     led_off(Led::Zero);
-    led_off(Led::One);
+
+    cfg_if::cfg_if! {
+        if #[cfg(not(any(target_board = "micromod-69", target_board = "micromod-28")))] {
+            led_off(Led::One);
+        }
+    }
     cfg_if::cfg_if! {
         if #[cfg(target_board = "okdo-e1")] {
             led_off(Led::Two);
@@ -697,7 +723,11 @@ fn enable_led_pins() {
     }
 
     gpio_driver.set_dir(LED_ZERO_PIN, Direction::Output);
-    gpio_driver.set_dir(LED_ONE_PIN, Direction::Output);
+    cfg_if::cfg_if! {
+        if #[cfg(not(any(target_board = "micromod-69", target_board = "micromod-28")))] {
+            gpio_driver.set_dir(LED_ONE_PIN, Direction::Output);
+        }
+    }
     cfg_if::cfg_if! {
         if #[cfg(target_board = "okdo-e1")] {
             gpio_driver.set_dir(LED_TWO_PIN, Direction::Output);
