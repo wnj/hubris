@@ -3,10 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::{
-    mgs_common::MgsCommon, update::rot::RotUpdate, update::sp::SpUpdate,
-    update::ComponentUpdater, usize_max, CriticalEvent, Log, MgsMessage,
+    ignition_controller::{self, IgnitionController},
+    mgs_common::MgsCommon,
+    update::rot::RotUpdate,
+    update::sp::SpUpdate,
+    update::ComponentUpdater,
+    usize_max, CriticalEvent, Log, MgsMessage,
 };
-use drv_user_leds_api::UserLeds;
 use gateway_messages::sp_impl::{
     BoundsChecked, DeviceDescription, Sender, SpHandler,
 };
@@ -30,8 +33,6 @@ use userlib::sys_get_timer;
 const UPDATE_BUFFER_SIZE: usize =
     usize_max(SpUpdate::BLOCK_SIZE, RotUpdate::BLOCK_SIZE);
 
-userlib::task_slot!(USER_LEDS, user_leds);
-
 // Create type aliases that include our `UpdateBuffer` size (i.e., the size of
 // the largest update chunk of all the components we update).
 pub(crate) type UpdateBuffer =
@@ -47,7 +48,7 @@ static UPDATE_MEMORY: UpdateBuffer = UpdateBuffer::new();
 
 pub(crate) struct MgsHandler {
     common: MgsCommon,
-    user_leds: UserLeds,
+    ignition: IgnitionController,
 }
 
 impl MgsHandler {
@@ -56,7 +57,7 @@ impl MgsHandler {
     pub(crate) fn claim_static_resources(base_mac_address: MacAddress) -> Self {
         Self {
             common: MgsCommon::claim_static_resources(base_mac_address),
-            user_leds: UserLeds::from(USER_LEDS.get_task_id()),
+            ignition: IgnitionController::new(),
         }
     }
 
@@ -80,8 +81,6 @@ impl MgsHandler {
         self.common.sp_update.step_preparation();
     }
 
-    pub(crate) fn drive_usart(&mut self) {}
-
     pub(crate) fn wants_to_send_packet_to_mgs(&mut self) -> bool {
         false
     }
@@ -100,7 +99,7 @@ impl MgsHandler {
         _offset: u64,
         _notification_bit: u8,
     ) -> Result<(), RequestError<ControlPlaneAgentError>> {
-        Err(ControlPlaneAgentError::DataUnavailable.into())
+        Err(ControlPlaneAgentError::OperationUnsupported.into())
     }
 
     pub(crate) fn get_host_phase2_data(
@@ -109,7 +108,7 @@ impl MgsHandler {
         _offset: u64,
         _data: Leased<idol_runtime::W, [u8]>,
     ) -> Result<usize, RequestError<ControlPlaneAgentError>> {
-        Err(ControlPlaneAgentError::DataUnavailable.into())
+        Err(ControlPlaneAgentError::OperationUnsupported.into())
     }
 
     pub(crate) fn startup_options_impl(
@@ -117,7 +116,7 @@ impl MgsHandler {
     ) -> Result<HostStartupOptions, RequestError<ControlPlaneAgentError>> {
         // We don't have a host to give startup options; no one should be
         // calling this method.
-        Err(ControlPlaneAgentError::InvalidStartupOptions.into())
+        Err(ControlPlaneAgentError::OperationUnsupported.into())
     }
 
     pub(crate) fn set_startup_options_impl(
@@ -126,18 +125,19 @@ impl MgsHandler {
     ) -> Result<(), RequestError<ControlPlaneAgentError>> {
         // We don't have a host to give startup options; no one should be
         // calling this method.
-        Err(ControlPlaneAgentError::InvalidStartupOptions.into())
+        Err(ControlPlaneAgentError::OperationUnsupported.into())
     }
 
     fn power_state_impl(&self) -> Result<PowerState, SpError> {
-        // We have no states other than A2.
+        // Minibar has no configurable power states.
         Ok(PowerState::A2)
     }
 }
 
 impl SpHandler for MgsHandler {
-    type BulkIgnitionStateIter = core::iter::Empty<IgnitionState>;
-    type BulkIgnitionLinkEventsIter = core::iter::Empty<ignition::LinkEvents>;
+    type BulkIgnitionStateIter = ignition_controller::BulkIgnitionStateIter;
+    type BulkIgnitionLinkEventsIter =
+        ignition_controller::BulkIgnitionLinkEventsIter;
     type VLanId = VLanId;
 
     fn ensure_request_trusted(
@@ -145,8 +145,7 @@ impl SpHandler for MgsHandler {
         kind: MgsRequest,
         _sender: Sender<VLanId>,
     ) -> Result<MgsRequest, SpError> {
-        // PSCs are okay with everyone talking to them, since they're behind the
-        // management network.
+        // Minibar trusts all requests.
         Ok(kind)
     }
 
@@ -155,8 +154,7 @@ impl SpHandler for MgsHandler {
         kind: MgsResponse,
         _sender: Sender<VLanId>,
     ) -> Option<MgsResponse> {
-        // PSCs are okay with everyone talking to them, since they're behind
-        // the management network.
+        // Minibar trusts all responses.
         Some(kind)
     }
 
@@ -168,14 +166,14 @@ impl SpHandler for MgsHandler {
     }
 
     fn num_ignition_ports(&mut self) -> Result<u32, SpError> {
-        Err(SpError::RequestUnsupportedForSp)
+        self.ignition.num_ports()
     }
 
     fn ignition_state(&mut self, target: u8) -> Result<IgnitionState, SpError> {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::IgnitionState {
             target
         }));
-        Err(SpError::RequestUnsupportedForSp)
+        self.ignition.target_state(target)
     }
 
     fn bulk_ignition_state(
@@ -185,7 +183,7 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::BulkIgnitionState {
             offset
         }));
-        Err(SpError::RequestUnsupportedForSp)
+        self.ignition.bulk_state(offset)
     }
 
     fn ignition_link_events(
@@ -195,7 +193,7 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::IgnitionLinkEvents {
             target
         }));
-        Err(SpError::RequestUnsupportedForSp)
+        self.ignition.target_link_events(target)
     }
 
     fn bulk_ignition_link_events(
@@ -205,18 +203,18 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(
             MgsMessage::BulkIgnitionLinkEvents { offset }
         ));
-        Err(SpError::RequestUnsupportedForSp)
+        self.ignition.bulk_link_events(offset)
     }
 
     fn clear_ignition_link_events(
         &mut self,
-        _target: Option<u8>,
-        _transceiver_select: Option<ignition::TransceiverSelect>,
+        target: Option<u8>,
+        transceiver_select: Option<ignition::TransceiverSelect>,
     ) -> Result<(), SpError> {
         ringbuf_entry_root!(Log::MgsMessage(
             MgsMessage::ClearIgnitionLinkEvents
         ));
-        Err(SpError::RequestUnsupportedForSp)
+        self.ignition.clear_link_events(target, transceiver_select)
     }
 
     fn ignition_command(
@@ -228,7 +226,7 @@ impl SpHandler for MgsHandler {
             target,
             command
         }));
-        Err(SpError::RequestUnsupportedForSp)
+        self.ignition.command(target, command)
     }
 
     fn sp_state(&mut self) -> Result<SpStateV2, SpError> {
@@ -272,24 +270,11 @@ impl SpHandler for MgsHandler {
     fn component_action(
         &mut self,
         _sender: Sender<VLanId>,
-        component: SpComponent,
-        action: ComponentAction,
+        _component: SpComponent,
+        _action: ComponentAction,
     ) -> Result<ComponentActionResponse, SpError> {
-        match (component, action) {
-            (SpComponent::SYSTEM_LED, ComponentAction::Led(action)) => {
-                use gateway_messages::LedComponentAction;
-                // Setting the LED should be infallible, because we know that
-                // this board supports LED 0 as the system LED.
-                match action {
-                    LedComponentAction::TurnOn => self.user_leds.led_on(0),
-                    LedComponentAction::TurnOff => self.user_leds.led_off(0),
-                    LedComponentAction::Blink => self.user_leds.led_blink(0),
-                }
-                .unwrap();
-                Ok(ComponentActionResponse::Ack)
-            }
-            _ => Err(SpError::RequestUnsupportedForComponent),
-        }
+        // Minibar doesn't support component actions yet.
+        Err(SpError::RequestUnsupportedForComponent)
     }
 
     fn update_status(
@@ -372,7 +357,7 @@ impl SpHandler for MgsHandler {
             power_state
         )));
 
-        // We have no states other than A2; always fail.
+        // Minibar has no configurable power states.
         Err(SpError::RequestUnsupportedForSp)
     }
 

@@ -65,6 +65,7 @@ enum I2cTxn {
     VCoreOff,
     VCoreUndervoltageInitialize,
     VCorePmbusStatus,
+    VCoreClearFaults,
     SocOn,
     SocOff,
 }
@@ -228,15 +229,15 @@ pub enum EreportClass {
 #[derive(microcbor::EncodeFields)]
 pub(crate) enum EreportKind {
     PmbusAlert {
-        refdes: FixedStr<{ crate::i2c_config::MAX_COMPONENT_ID_LEN }>,
+        refdes: FixedStr<'static, { crate::i2c_config::MAX_COMPONENT_ID_LEN }>,
         // 9 is the maximum length rail name used in this module (`VDD_VCORE`)
-        rail: &'static FixedStr<9>,
+        rail: FixedStr<'static, 9>,
         time: u64,
         pwr_good: Option<bool>,
         pmbus_status: PmbusStatus,
     },
     Bmr491MitigationFailure {
-        refdes: FixedStr<{ crate::i2c_config::MAX_COMPONENT_ID_LEN }>,
+        refdes: FixedStr<'static, { crate::i2c_config::MAX_COMPONENT_ID_LEN }>,
         failures: u32,
         last_cause: drv_i2c_devices::bmr491::MitigationFailureKind,
         succeeded: bool,
@@ -727,6 +728,10 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
             }
         }
 
+        if self.vcore.is_faulted() {
+            self.vcore.try_to_clear_faults();
+        }
+
         if let Some(interval) = self.poll_interval() {
             self.deadline += interval;
             sys_set_timer(Some(self.deadline), notifications::TIMER_MASK);
@@ -1163,10 +1168,14 @@ impl<S: SpiServer> ServerImpl<S> {
     // for a thermtrip or for someone disabling NIC_PWREN_L.  If we are in
     // any other state, we don't need to poll.
     //
+    // If the Vcore VRM has a PMBus alert, we must try to clear its faults
+    // periodically, regardless of the current power state.
+    //
     fn poll_interval(&self) -> Option<u64> {
         match self.state {
             PowerState::A0 => Some(10),
             PowerState::A0PlusHP => Some(100),
+            _ if self.vcore.is_faulted() => Some(100),
             _ => None,
         }
     }
@@ -1237,6 +1246,25 @@ impl<S: SpiServer> idl::InOrderSequencerImpl for ServerImpl<S> {
     fn last_post_code(
         &mut self,
         _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
+
+    fn post_code_buffer_len(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
+
+    fn get_post_code(
+        &mut self,
+        _: &RecvMessage,
+        _index: u32,
     ) -> Result<u32, RequestError<core::convert::Infallible>> {
         Err(RequestError::Fail(
             idol_runtime::ClientError::BadMessageContents,
@@ -1606,7 +1634,7 @@ fn try_send_ereport(
     class: EreportClass,
     report: EreportKind,
 ) {
-    let eresult = packrat.encode_ereport(
+    let eresult = packrat.deliver_microcbor_ereport(
         &packrat_api::Ereport {
             class,
             version: 0,
