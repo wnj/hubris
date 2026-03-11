@@ -7,26 +7,26 @@ image-names = ["a", "b"]
 
 [kernel]
 name = "micromod-69"
-features = ["dump", "dice-self"]
-requires = { flash = 55040, ram = 3376 }
+# features = ["dump", "dice-self"]
+requires = { flash = 55040, ram = 2704 }
 
-[caboose]
-region = "flash"
-size = 256
-default = true
+# [caboose]
+# region = "flash"
+# size = 256
+# default = true
 
 [tasks.jefe]
 name = "task-jefe"
 priority = 0
 max-sizes = { flash = 16384, ram = 4096 }
 start = true
-features = ["dump"]
+# features = ["dump"]
 stacksize = 2000
 notifications = ["fault", "timer"]
 extern-regions = ["sram2"]
 
-[tasks.jefe.config.allowed-callers]
-request_reset = ["update_server"]
+# [tasks.jefe.config.allowed-callers]
+# request_reset = ["update_server"]
 
 [tasks.hiffy]
 name = "task-hiffy"
@@ -35,7 +35,8 @@ features = ["lpc55", "gpio"]
 max-sizes = { flash = 32768, ram = 16384 }
 stacksize = 2048
 start = true
-task-slots = ["gpio_driver", "update_server"]
+# task-slots = ["gpio_driver", "update_server"]
+task-slots = ["gpio_driver"]
 
 [tasks.idle]
 name = "task-idle"
@@ -44,17 +45,17 @@ max-sizes = { flash = 256, ram = 256 }
 stacksize = 256
 start = true
 
-[tasks.update_server]
-name = "lpc55-update-server"
-priority = 3
-max-sizes = { flash = 26720, ram = 16704 }
-stacksize = 8192
-start = true
-sections = { bootstate = "usbsram" }
-uses = ["flash_controller", "hash_crypt"]
-notifications = ["flash-irq", "hashcrypt-irq"]
-interrupts = { "flash_controller.irq" = "flash-irq", "hash_crypt.irq" = "hashcrypt-irq" }
-task-slots = [{ "syscon" = "syscon_driver" }, "jefe"]
+# [tasks.update_server]
+# name = "lpc55-update-server"
+# priority = 3
+# max-sizes = { flash = 26720, ram = 16704 }
+# stacksize = 8192
+# start = true
+# sections = { bootstate = "usbsram" }
+# uses = ["flash_controller", "hash_crypt"]
+# notifications = ["flash-irq", "hashcrypt-irq"]
+# interrupts = { "flash_controller.irq" = "flash-irq", "hash_crypt.irq" = "hashcrypt-irq" }
+# task-slots = [{ "syscon" = "syscon_driver" }, "jefe"]
 
 [tasks.syscon_driver]
 name = "drv-lpc55-syscon"
@@ -101,13 +102,13 @@ pins = [
     { pin = { port = 0, pin = 30 }, alt = 1 },
 ]
 
-[tasks.i2c_driver]
-name = "drv-lpc55-i2c"
-priority = 4
-uses = ["flexcomm4"]
-start = true
-stacksize = 1000
-task-slots = ["gpio_driver", "syscon_driver"]
+# [tasks.i2c_driver]
+# name = "drv-lpc55-i2c"
+# priority = 4
+# uses = ["flexcomm4"]
+# start = true
+# stacksize = 1000
+# task-slots = ["gpio_driver", "syscon_driver"]
 
 [tasks.rng_driver]
 name = "drv-lpc55-rng"
@@ -127,23 +128,23 @@ stacksize = 1000
 notifications = ["timer"]
 task-slots = ["user_leds"]
 
-[tasks.dump_agent]
-name = "task-dump-agent"
-features = ["no-rot"]
-priority = 5
-max-sizes = { flash = 32768, ram = 2272 }
-start = true
-task-slots = ["jefe"]
-stacksize = 1536
-extern-regions = ["sram2"]
+# [tasks.dump_agent]
+# name = "task-dump-agent"
+# features = ["no-rot"]
+# priority = 5
+# max-sizes = { flash = 32768, ram = 2272 }
+# start = true
+# task-slots = ["jefe"]
+# stacksize = 1536
+# extern-regions = ["sram2"]
 
-[tasks.attest]
-name = "task-attest"
-priority = 5
-max-sizes = { flash = 35072, ram = 16384 }
-stacksize = 12304
-start = true
-extern-regions = ["dice_alias", "dice_certs"]
+# [tasks.attest]
+# name = "task-attest"
+# priority = 5
+# max-sizes = { flash = 35072, ram = 16384 }
+# stacksize = 12304
+# start = true
+# extern-regions = ["dice_alias", "dice_certs"]
 
 [signing.certs]
 signing-certs = ["../../support/fake_certs/fake_certificate.der.crt"]
