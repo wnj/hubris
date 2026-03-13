@@ -616,7 +616,15 @@ cfg_if::cfg_if! {
                 const LED_OFF_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::One;
                 const LED_ON_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::Zero;
             } else if #[cfg(any(target_board = "micromod-69", target_board = "micromod-28"))] {
-                const LED_ZERO_PIN: drv_lpc55_gpio_api::Pin = drv_lpc55_gpio_api::Pin::PIO0_28; // Red?
+                const LED_ZERO_PIN: drv_lpc55_gpio_api::Pin = drv_lpc55_gpio_api::Pin::PIO0_28; // Red
+
+                // micromod-69 is active high LED
+                const LED_OFF_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::Zero;
+                const LED_ON_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::One;
+            } else if #[cfg(target_board = "micromod-69jev")] {
+                const LED_ZERO_PIN: drv_lpc55_gpio_api::Pin = drv_lpc55_gpio_api::Pin::PIO1_1; // Red
+                const LED_ONE_PIN: drv_lpc55_gpio_api::Pin = drv_lpc55_gpio_api::Pin::PIO1_2; // Green
+                const LED_TWO_PIN: drv_lpc55_gpio_api::Pin = drv_lpc55_gpio_api::Pin::PIO1_3; // Blue
 
                 // micromod-69 is active high LED
                 const LED_OFF_VAL: drv_lpc55_gpio_api::Value = drv_lpc55_gpio_api::Value::Zero;
@@ -640,6 +648,12 @@ const fn led_gpio_num(led: Led) -> drv_lpc55_gpio_api::Pin {
         } else if #[cfg(any(target_board = "micromod-69", target_board = "micromod-28"))] {
             match led {
                 Led::Zero => LED_ZERO_PIN,
+            }
+        } else if #[cfg(target_board = "micromod-69jev")] {
+            match led {
+                Led::Zero => LED_ZERO_PIN,
+                Led::One => LED_ONE_PIN,
+                Led::Two => LED_TWO_PIN,
             }
         } else {
             match led {
