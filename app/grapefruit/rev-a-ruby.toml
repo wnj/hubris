@@ -1,4 +1,5 @@
-name = "grapefruit-ruby"
+name = "grapefruit-ruby-a"
+board = "grapefruit-a"
 inherit = "base.toml"
 
 # Host SP comms goes over a UART to the FPGA, which translates to eSPI messages
@@ -155,3 +156,9 @@ name = "lm75_h"
 sensors = { temperature = 1 }
 description = "LM75 (H)"
 refdes = "U104"
+
+[[config.sensor.devices]]
+name = "fan_ctrl"
+device = "thermal_loop"
+description = "Thermal loop"
+sensors.pwm = 1

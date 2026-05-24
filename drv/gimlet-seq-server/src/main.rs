@@ -14,23 +14,24 @@ use counters::*;
 use fixedstr::FixedStr;
 use ringbuf::*;
 use userlib::{
-    hl, set_timer_relative, sys_get_timer, sys_recv_notification,
-    sys_set_timer, task_slot, units, RecvMessage, TaskId, UnwrapLite,
+    RecvMessage, TaskId, UnwrapLite, hl, set_timer_relative, sys_get_timer,
+    sys_recv_notification, sys_set_timer, task_slot, units,
 };
 use zerocopy::IntoBytes;
 
+use crate::i2c_config::MAX_COMPONENT_ID_LEN as REFDES_LEN;
 use drv_cpu_seq_api::{PowerState, SeqError, StateChangeReason, Transition};
 use drv_hf_api as hf_api;
 use drv_i2c_api as i2c;
 use drv_ice40_spi_program as ice40;
-use drv_packrat_vpd_loader::{read_vpd_and_load_packrat, Packrat};
+use drv_packrat_vpd_loader::{Packrat, read_vpd_and_load_packrat};
 use drv_spi_api::{SpiDevice, SpiServer};
 use drv_stm32xx_sys_api as sys_api;
 use idol_runtime::{NotificationHandler, RequestError};
 use seq_spi::{Addr, Reg};
+use spd::ee1004 as spd; // DDR4 SPD types
 use static_assertions::const_assert;
 use task_jefe_api::Jefe;
-use task_packrat_api as packrat_api;
 
 task_slot!(SYS, sys);
 task_slot!(SPI, spi_driver);
@@ -157,14 +158,11 @@ enum Trace {
         retries_remaining: u8,
     },
     StartFailed(#[count(children)] SeqError),
-    EreportSent(usize),
-    EreportLost(usize, packrat_api::EreportWriteError),
-    EreportTooBig,
 }
 
 counted_ringbuf!(Trace, 128, Trace::None);
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     let sys = sys_api::Sys::from(SYS.get_task_id());
     let jefe = Jefe::from(JEFE.get_task_id());
@@ -202,58 +200,18 @@ fn main() -> ! {
 
 struct ServerImpl<S: SpiServer> {
     state: PowerState,
+    /// The Hubris tick at which we transitioned to the current state.
+    since: u64,
     sys: sys_api::Sys,
     seq: seq_spi::SequencerFpga<S>,
     jefe: Jefe,
     hf: hf_api::HostFlash,
     vcore: vcore::VCore,
     deadline: u64,
-    // Buffer for encoding ereports. This is a static so that it's not on the
-    // stack when handling interrupts.
-    ereport_buf: &'static mut [u8; EREPORT_BUF_LEN],
+    ereporter: Ereporter,
 }
 
 const TIMER_INTERVAL: u32 = 10;
-const EREPORT_BUF_LEN: usize = microcbor::max_cbor_len_for!(
-    task_packrat_api::Ereport<EreportClass, EreportKind>
-);
-
-#[derive(microcbor::Encode)]
-pub enum EreportClass {
-    #[cbor(rename = "hw.pwr.pmbus.alert")]
-    PmbusAlert,
-    #[cbor(rename = "hw.pwr.bmr491.mitfail")]
-    Bmr491MitigationFailure,
-}
-
-#[derive(microcbor::EncodeFields)]
-pub(crate) enum EreportKind {
-    PmbusAlert {
-        refdes: FixedStr<'static, { crate::i2c_config::MAX_COMPONENT_ID_LEN }>,
-        // 9 is the maximum length rail name used in this module (`VDD_VCORE`)
-        rail: FixedStr<'static, 9>,
-        time: u64,
-        pwr_good: Option<bool>,
-        pmbus_status: PmbusStatus,
-    },
-    Bmr491MitigationFailure {
-        refdes: FixedStr<'static, { crate::i2c_config::MAX_COMPONENT_ID_LEN }>,
-        failures: u32,
-        last_cause: drv_i2c_devices::bmr491::MitigationFailureKind,
-        succeeded: bool,
-    },
-}
-
-#[derive(Copy, Clone, Default, microcbor::Encode)]
-pub(crate) struct PmbusStatus {
-    word: Option<u16>,
-    input: Option<u8>,
-    iout: Option<u8>,
-    vout: Option<u8>,
-    temp: Option<u8>,
-    cml: Option<u8>,
-    mfr: Option<u8>,
-}
 
 impl<S: SpiServer + Clone> ServerImpl<S> {
     fn init(
@@ -490,13 +448,8 @@ impl<S: SpiServer + Clone> ServerImpl<S> {
             hl::sleep_for(1);
         }
 
-        let ereport_buf = {
-            use static_cell::ClaimOnceCell;
-            static EREPORT_BUF: ClaimOnceCell<[u8; EREPORT_BUF_LEN]> =
-                ClaimOnceCell::new([0; EREPORT_BUF_LEN]);
-            EREPORT_BUF.claim()
-        };
         let packrat = Packrat::from(PACKRAT.get_task_id());
+        let mut ereporter = Ereporter::claim_static_resources(packrat.clone());
 
         //
         // Apply the configuration mitigation on the BMR491, if required. This
@@ -523,17 +476,15 @@ impl<S: SpiServer + Clone> ServerImpl<S> {
 
             if let Some(last_cause) = last_cause {
                 // Report the failure even if we eventually succeeded.
-                try_send_ereport(
-                    &packrat,
-                    &mut ereport_buf[..],
-                    EreportClass::Bmr491MitigationFailure,
-                    EreportKind::Bmr491MitigationFailure {
-                        refdes: FixedStr::from_str(dev.component_id()),
-                        failures,
-                        last_cause,
-                        succeeded,
-                    },
-                );
+                let ereport = ereports::pwr::Bmr491MitigationFailure {
+                    refdes: FixedStr::<{ REFDES_LEN }>::from_str(
+                        dev.component_id(),
+                    ),
+                    failures,
+                    last_cause,
+                    succeeded,
+                };
+                let _ = ereporter.deliver_ereport(&ereport);
             }
         }
 
@@ -581,13 +532,14 @@ impl<S: SpiServer + Clone> ServerImpl<S> {
 
         let mut server = Self {
             state: PowerState::A2,
+            since: 0, // we have been in A2 since we booted :)
             sys: sys.clone(),
             seq,
             jefe,
             hf,
             deadline: 0,
-            vcore: vcore::VCore::new(sys, packrat, &device, rail),
-            ereport_buf,
+            vcore: vcore::VCore::new(sys, &device, rail),
+            ereporter,
         };
 
         // Power on, unless suppressed by the `stay-in-a2` feature
@@ -627,7 +579,7 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
 
     fn handle_notification(&mut self, bits: userlib::NotificationBits) {
         if bits.check_notification_mask(self.vcore.mask()) {
-            self.vcore.handle_notification(self.ereport_buf);
+            self.vcore.handle_notification(&mut self.ereporter);
         }
 
         if !bits.has_timer_fired(notifications::TIMER_MASK) {
@@ -643,6 +595,7 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
         });
 
         if self.state == PowerState::A0 || self.state == PowerState::A0PlusHP {
+            let now = sys_get_timer().now;
             //
             // The first order of business is to check if sequencer saw a
             // falling edge on PWROK (denoting a reset) or a THERMTRIP.  If it
@@ -650,8 +603,8 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
             // if both are indicated, we will clear both conditions -- but
             // land in A0Thermtrip).
             //
-            self.check_reset(ifr);
-            self.check_thermtrip(ifr);
+            self.check_reset(ifr, now);
+            self.check_thermtrip(ifr, now);
 
             //
             // Now we need to check NIC_PWREN_L to assure that our power state
@@ -669,7 +622,7 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
                     self.seq
                         .clear_bytes(Addr::NIC_CTRL, &[cld_rst])
                         .unwrap_lite();
-                    self.update_state_internal(PowerState::A0PlusHP);
+                    self.update_state_internal(PowerState::A0PlusHP, now);
                 }
 
                 (PowerState::A0PlusHP, true) => {
@@ -701,7 +654,10 @@ impl<S: SpiServer> NotificationHandler for ServerImpl<S> {
                     self.seq
                         .set_bytes(Addr::NIC_CTRL, &[cld_rst])
                         .unwrap_lite();
-                    self.update_state_internal(PowerState::A0);
+                    self.update_state_internal(
+                        PowerState::A0,
+                        sys_get_timer().now,
+                    );
                 }
 
                 (PowerState::A0, true) | (PowerState::A0PlusHP, false) => {
@@ -772,8 +728,9 @@ where
 }
 
 impl<S: SpiServer> ServerImpl<S> {
-    fn update_state_internal(&mut self, state: PowerState) {
+    fn update_state_internal(&mut self, state: PowerState, now: u64) {
         ringbuf_entry!(Trace::UpdateState(state));
+        self.since = now;
         self.state = state;
         self.jefe.set_state(state as u32);
     }
@@ -891,6 +848,11 @@ impl<S: SpiServer> ServerImpl<S> {
                 ringbuf_entry!(Trace::CPUPresent(present));
 
                 if !present {
+                    let _ = self.ereporter.deliver_ereport(
+                        &ereports::cpu::CpuMissing {
+                            cpu: &HOST_CPU_REFDES,
+                        },
+                    );
                     return Err(self.a0_failure(SeqError::CPUNotPresent));
                 }
 
@@ -910,7 +872,21 @@ impl<S: SpiServer> ServerImpl<S> {
                 // be high (not connected on Type-0/Type-1/Type-2), and SP3R2
                 // to be low (VSS on Type-0/Type-1/Type-2).
                 //
-                if !coretype || !sp3r1 || sp3r2 {
+                let rev_ok = sp3r1 && !sp3r2;
+                if !coretype || !rev_ok {
+                    let _ = self.ereporter.deliver_ereport(
+                        &ereports::cpu::UnsupportedCpu {
+                            cpu: &HOST_CPU_REFDES,
+                            coretype: ereports::cpu::CpuTypeBits {
+                                bits: [coretype],
+                                ok: coretype,
+                            },
+                            rev: ereports::cpu::CpuTypeBits {
+                                bits: [sp3r1, sp3r2],
+                                ok: rev_ok,
+                            },
+                        },
+                    );
                     return Err(self.a0_failure(SeqError::UnrecognizedCPU));
                 }
 
@@ -990,11 +966,10 @@ impl<S: SpiServer> ServerImpl<S> {
                 // Using wrapping_sub here because the timer is monotonic, so
                 // we, the programmers, know that now > start. rustc, the
                 // compiler, is not aware of this.
-                ringbuf_entry!(Trace::A0(
-                    (sys_get_timer().now.wrapping_sub(start)) as u16
-                ));
+                let now = sys_get_timer().now;
+                ringbuf_entry!(Trace::A0((now.wrapping_sub(start)) as u16));
 
-                self.update_state_internal(PowerState::A0);
+                self.update_state_internal(PowerState::A0, now);
                 Ok(Transition::Changed)
             }
 
@@ -1040,7 +1015,7 @@ impl<S: SpiServer> ServerImpl<S> {
                     return Err(SeqError::MuxToSPFailed);
                 }
 
-                self.update_state_internal(PowerState::A2);
+                self.update_state_internal(PowerState::A2, sys_get_timer().now);
                 ringbuf_entry_v3p3_sys_a0_vout();
                 ringbuf_entry!(Trace::A2);
 
@@ -1117,12 +1092,16 @@ impl<S: SpiServer> ServerImpl<S> {
     // seen it (and knowing that the FPGA has already taken care of the
     // time-critical bits to assure that we don't melt!).
     //
-    fn check_thermtrip(&mut self, ifr: u8) {
+    fn check_thermtrip(&mut self, ifr: u8, now: u64) {
         let thermtrip = Reg::IFR::THERMTRIP;
 
         if ifr & thermtrip != 0 {
             self.seq.clear_bytes(Addr::IFR, &[thermtrip]).unwrap_lite();
-            self.update_state_internal(PowerState::A0Thermtrip);
+            let _ = self.ereporter.deliver_ereport(&ereports::cpu::Thermtrip {
+                cpu: &HOST_CPU_REFDES,
+                state: self.ereport_current_state(),
+            });
+            self.update_state_internal(PowerState::A0Thermtrip, now);
         }
     }
 
@@ -1134,7 +1113,7 @@ impl<S: SpiServer> ServerImpl<S> {
     // of RESET_L.  If we have seen a host reset, we send ourselves to
     // A0Reset.
     //
-    fn check_reset(&mut self, ifr: u8) {
+    fn check_reset(&mut self, ifr: u8, now: u64) {
         let pwrok_fedge = Reg::IFR::AMD_PWROK_FEDGE;
 
         if ifr & pwrok_fedge != 0 {
@@ -1158,7 +1137,7 @@ impl<S: SpiServer> ServerImpl<S> {
             let mask = pwrok_fedge | Reg::IFR::AMD_RSTN_FEDGE;
             self.seq.clear_bytes(Addr::IFR, &[mask]).unwrap_lite();
 
-            self.update_state_internal(PowerState::A0Reset);
+            self.update_state_internal(PowerState::A0Reset, now);
         }
     }
 
@@ -1177,6 +1156,13 @@ impl<S: SpiServer> ServerImpl<S> {
             PowerState::A0PlusHP => Some(100),
             _ if self.vcore.is_faulted() => Some(100),
             _ => None,
+        }
+    }
+
+    fn ereport_current_state(&self) -> ereports::pwr::CurrentState {
+        ereports::pwr::CurrentState {
+            cur: self.state,
+            since_ms: self.since,
         }
     }
 }
@@ -1292,6 +1278,24 @@ impl<S: SpiServer> idl::InOrderSequencerImpl for ServerImpl<S> {
             .unwrap_lite();
         Ok(out.get())
     }
+
+    fn enable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
+
+    fn disable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
 }
 
 fn read_spd_data_and_load_packrat(
@@ -1339,7 +1343,7 @@ fn read_spd_data_and_load_packrat(
     for nbank in 0..BANKS.len() as u8 {
         let (controller, port, mux) = BANKS[nbank as usize];
 
-        let addr = spd::Function::PageAddress(spd::Page(0))
+        let addr = spd::Function::PageAddress(spd::Page::Page0)
             .to_device_code()
             .unwrap_lite();
         let page =
@@ -1394,7 +1398,7 @@ fn read_spd_data_and_load_packrat(
         }
 
         // Now flip over to the top page.
-        let addr = spd::Function::PageAddress(spd::Page(1))
+        let addr = spd::Function::PageAddress(spd::Page::Page1)
             .to_device_code()
             .unwrap_lite();
         let page =
@@ -1628,30 +1632,32 @@ cfg_if::cfg_if! {
     }
 }
 
-fn try_send_ereport(
-    packrat: &packrat_api::Packrat,
-    ereport_buf: &mut [u8],
-    class: EreportClass,
-    report: EreportKind,
-) {
-    let eresult = packrat.deliver_microcbor_ereport(
-        &packrat_api::Ereport {
-            class,
-            version: 0,
-            report,
-        },
-        ereport_buf,
-    );
-    match eresult {
-        Ok(len) => ringbuf_entry!(Trace::EreportSent(len)),
-        Err(task_packrat_api::EreportEncodeError::Packrat { len, err }) => {
-            ringbuf_entry!(Trace::EreportLost(len, err))
-        }
-        Err(task_packrat_api::EreportEncodeError::Encoder(_)) => {
-            ringbuf_entry!(Trace::EreportTooBig)
-        }
+////////////////////////////////////////////////////////////////////////////////
+
+ereports::declare_ereporter! {
+    pub(crate) struct Ereporter<SeqEreport> {
+        PmbusAlert(
+            ereports::pwr::PmbusAlert<
+                FixedStr<'static, 9>,
+                { REFDES_LEN },
+            >,
+        ),
+        Bmr491MitigationFailure(
+            ereports::pwr::Bmr491MitigationFailure<{ REFDES_LEN }>
+        ),
+        Thermtrip(ereports::cpu::Thermtrip),
+        UnsupportedCpu(ereports::cpu::UnsupportedCpu<1, 2>),
+        CpuMissing(ereports::cpu::CpuMissing),
     }
 }
+
+static HOST_CPU_REFDES: ereports::cpu::HostCpuRefdes =
+    ereports::cpu::HostCpuRefdes {
+        refdes: fixedstr::FixedString::from_str("P0"),
+        dev_id: fixedstr::FixedString::from_str("sp3-host-cpu"),
+    };
+
+////////////////////////////////////////////////////////////////////////////////
 
 mod idl {
     use super::StateChangeReason;

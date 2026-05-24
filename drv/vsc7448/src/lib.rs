@@ -16,7 +16,7 @@ mod serdes10g;
 mod serdes1g;
 
 use crate::config::{PortConfig, PortDev, PortMap, PortMode, PortSerdes};
-use userlib::{hl::sleep_for, UnwrapLite};
+use userlib::{UnwrapLite, hl::sleep_for};
 use vsc7448_pac::{types::RegisterAddress, *};
 
 pub use config::Speed;
@@ -741,10 +741,17 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
             if let Some(mask) = f(p) {
                 // Configure the 0x1YY VLAN, using our closure to decide what
                 // mask to apply
-                self.write_port_mask(
-                    ANA_L3().VLAN(0x100 + p as u16).VLAN_MASK_CFG(),
-                    mask,
-                )?;
+                let vid = 0x100 + p as u16;
+                self.write_port_mask(ANA_L3().VLAN(vid).VLAN_MASK_CFG(), mask)?;
+
+                // Configure the VLAN so that the classified VID is also copied
+                // to the FID ("filtering ID") field in packet metadata.  The
+                // FID is used as part of the MAC table entry (along with the
+                // source MAC), so this is necessary to make the MAC tables
+                // VLAN-aware.
+                self.write_with(ANA_L3().VLAN(vid).VLAN_CFG(), |r| {
+                    r.set_vlan_fid(u32::from(vid))
+                })?;
             }
         }
         Ok(())
@@ -958,21 +965,23 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
     fn sidecar_vlan_unlock_scrimlet(&self) -> Result<(), VscError> {
         self.configure_vlans(|p| match p {
             sidecar::UPLINK => None,
-            // Technician ports are connected to uplink and scrimlets
+            // Technician ports connect to uplink, scrimlets, and sidecar SPs
             sidecar::TECHNICIAN_1 | sidecar::TECHNICIAN_2 => Some(
                 (1 << p)
                     | (1 << sidecar::UPLINK)
                     | (1 << sidecar::CUBBY_14)
-                    | (1 << sidecar::CUBBY_16),
+                    | (1 << sidecar::CUBBY_16)
+                    | (1 << sidecar::LOCAL_SP),
             ),
-            // Scrimlet SPs are connected to the Tofino and technician ports
-            sidecar::CUBBY_14 | sidecar::CUBBY_16 => Some(
+            // Scrimlet and Sidecar SPs are the only things connected to the
+            // technician ports (and are also connected to the Tofino, as usual)
+            sidecar::CUBBY_14 | sidecar::CUBBY_16 | sidecar::LOCAL_SP => Some(
                 (1 << p)
                     | (1 << sidecar::UPLINK)
                     | (1 << sidecar::TECHNICIAN_1)
                     | (1 << sidecar::TECHNICIAN_2),
             ),
-            // Other SPs are only connected to the uplink port
+            // Other SPs are only connected to the Tofino uplink port
             _ => Some((1 << p) | (1 << sidecar::UPLINK)),
         })
     }

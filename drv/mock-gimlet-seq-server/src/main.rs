@@ -14,7 +14,7 @@ use userlib::{FromPrimitive, RecvMessage, UnwrapLite};
 
 userlib::task_slot!(JEFE, jefe);
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     let mut buffer = [0; idl::INCOMING_SIZE];
     let mut server = ServerImpl::init(Jefe::from(JEFE.get_task_id()));
@@ -144,6 +144,20 @@ impl idl::InOrderSequencerImpl for ServerImpl {
         _: &RecvMessage,
     ) -> Result<u32, RequestError<core::convert::Infallible>> {
         Ok(0)
+    }
+
+    fn enable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        Ok(())
+    }
+
+    fn disable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        Ok(())
     }
 }
 

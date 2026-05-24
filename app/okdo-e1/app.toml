@@ -8,12 +8,11 @@ image-names = ["a", "b"]
 [kernel]
 name = "okdo-e1"
 features = ["dump", "dice-self"]
-requires = { flash = 55040, ram = 3376 }
+requires = { flash = 55040, ram = 3216 }
 
 [caboose]
 region = "flash"
 size = 256
-default = true
 
 [tasks.jefe]
 name = "task-jefe"
@@ -36,6 +35,7 @@ max-sizes = { flash = 32768, ram = 16384 }
 stacksize = 2048
 start = true
 task-slots = ["gpio_driver", "update_server"]
+notifications = ["timer"]
 
 [tasks.idle]
 name = "task-idle"
@@ -108,15 +108,6 @@ uses = ["flexcomm4"]
 start = true
 stacksize = 1000
 task-slots = ["gpio_driver", "syscon_driver"]
-
-[tasks.rng_driver]
-name = "drv-lpc55-rng"
-priority = 3
-max-sizes = { flash = 16384, ram = 4096 }
-uses = ["rng", "pmc"]
-start = true
-stacksize = 2216
-task-slots = ["syscon_driver"]
 
 [tasks.pong]
 name = "task-pong"

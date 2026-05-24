@@ -15,9 +15,9 @@ use task_jefe_api::Jefe;
 use task_packrat_api::{
     CacheSetError, MacAddressBlock, OxideIdentity, Packrat,
 };
-use userlib::{hl, task_slot, FromPrimitive, RecvMessage, UnwrapLite};
+use userlib::{FromPrimitive, RecvMessage, UnwrapLite, hl, task_slot};
 
-use ringbuf::{counted_ringbuf, ringbuf_entry, Count};
+use ringbuf::{Count, counted_ringbuf, ringbuf_entry};
 
 task_slot!(JEFE, jefe);
 task_slot!(LOADER, spartan7_loader);
@@ -36,7 +36,7 @@ counted_ringbuf!(Trace, 128, Trace::None);
 task_slot!(SYS, sys);
 task_slot!(PACKRAT, packrat);
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     let sys = sys_api::Sys::from(SYS.get_task_id());
 
@@ -229,6 +229,24 @@ impl idl::InOrderSequencerImpl for ServerImpl {
         &mut self,
         _: &RecvMessage,
     ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
+
+    fn enable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        Err(RequestError::Fail(
+            idol_runtime::ClientError::BadMessageContents,
+        ))
+    }
+
+    fn disable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
         Err(RequestError::Fail(
             idol_runtime::ClientError::BadMessageContents,
         ))

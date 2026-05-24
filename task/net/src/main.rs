@@ -39,13 +39,17 @@ mod server;
     any(target_board = "psc-b", target_board = "psc-c"),
     path = "bsp/psc_bc.rs"
 )]
+#[cfg_attr(target_board = "observer-a", path = "bsp/observer_a.rs")]
 #[cfg_attr(target_board = "gimletlet-1", path = "bsp/gimletlet_mgmt.rs")]
 #[cfg_attr(
     all(target_board = "gimletlet-2", feature = "gimletlet-nic"),
     path = "bsp/gimletlet_nic.rs"
 )]
 #[cfg_attr(target_board = "medusa-a", path = "bsp/medusa_a.rs")]
-#[cfg_attr(target_board = "grapefruit", path = "bsp/grapefruit.rs")]
+#[cfg_attr(
+    any(target_board = "grapefruit-a", target_board = "grapefruit-b",),
+    path = "bsp/grapefruit.rs"
+)]
 #[cfg_attr(
     any(target_board = "minibar-a", target_board = "minibar-b"),
     path = "bsp/minibar.rs"
@@ -167,7 +171,7 @@ enum Event {
 }
 counters!(Event);
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     let sys = SYS.get_task_id();
     let sys = Sys::from(sys);

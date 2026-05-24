@@ -3,14 +3,27 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    build_util::expose_target_board();
+    build_util::build_notifications()?;
+
+    let board = build_util::env_var("HUBRIS_BOARD")?;
+    if board != "sidecar-b"
+        && board != "sidecar-c"
+        && board != "sidecar-d"
+        && board != "medusa-a"
+    {
+        panic!("unknown target board");
+    }
+
     idol::Generator::new()
         .with_counters(
             idol::CounterSettings::default().with_server_counters(false),
         )
         .build_server_support(
-            "../../idl/rng.idol",
+            "../../idl/front-io.idol",
             "server_stub.rs",
             idol::server::ServerStyle::InOrder,
         )?;
+
     Ok(())
 }

@@ -1,7 +1,7 @@
 [package]
 name = "task-control-plane-agent"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 cfg-if.workspace = true
@@ -66,6 +66,7 @@ gimlet = ["compute-sled"]
 cosmo = ["compute-sled"]
 sidecar = ["drv-sidecar-seq-api", "drv-monorail-api", "drv-ignition-api", "drv-transceivers-api", "p256", "sha2", "drv-rng-api"]
 psc = ["drv-user-leds-api"]
+observer = ["drv-user-leds-api"]
 minibar = ["drv-ignition-api"]
 vpd = ["task-vpd-api"]
 vlan = ["task-net-api/vlan"]
