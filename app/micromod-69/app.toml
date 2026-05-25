@@ -8,7 +8,7 @@ image-names = ["a", "b"]
 [kernel]
 name = "micromod-69"
 # features = ["dump", "dice-self"]
-requires = { flash = 55040, ram = 2704 }
+requires = { flash = 55040, ram = 2544 }
 
 # [caboose]
 # region = "flash"
@@ -37,6 +37,7 @@ stacksize = 2048
 start = true
 # task-slots = ["gpio_driver", "update_server"]
 task-slots = ["gpio_driver"]
+notifications = ["timer"]
 
 [tasks.idle]
 name = "task-idle"
@@ -109,15 +110,6 @@ pins = [
 # start = true
 # stacksize = 1000
 # task-slots = ["gpio_driver", "syscon_driver"]
-
-[tasks.rng_driver]
-name = "drv-lpc55-rng"
-priority = 3
-max-sizes = { flash = 16384, ram = 4096 }
-uses = ["rng", "pmc"]
-start = true
-stacksize = 2216
-task-slots = ["syscon_driver"]
 
 [tasks.pong]
 name = "task-pong"

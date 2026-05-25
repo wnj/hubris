@@ -109,7 +109,7 @@ cfg_if::cfg_if! {
     // Target boards with 2 leds -> the rest
     else {
         cfg_if::cfg_if! {
-            if #[cfg(target_board = "okdo-e1")] {
+            if #[cfg(any(target_board = "okdo-e1", target_board = "micromod-69jev"))] {
                 #[derive(enum_map::Enum, Copy, Clone, FromPrimitive)]
                 enum Led {
                     Zero = 0,
