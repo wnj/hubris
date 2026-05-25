@@ -4055,6 +4055,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "micromod-g030"
+version = "0.1.0"
+dependencies = [
+ "build-util",
+ "cfg-if",
+ "cortex-m",
+ "cortex-m-rt",
+ "kern",
+ "stm32g0",
+]
+
+[[package]]
 name = "minibar"
 version = "0.1.0"
 dependencies = [

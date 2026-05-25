@@ -101,6 +101,7 @@ cfg_if::cfg_if! {
         target_board = "grapefruit-a",
         target_board = "grapefruit-b",
         target_board = "stm32g030-proto",
+        target_board = "micromod-g030",
     ))] {
         #[derive(enum_map::Enum, Copy, Clone, FromPrimitive)]
         enum Led {
@@ -375,6 +376,10 @@ cfg_if::cfg_if! {
                     target_board = "stm32g030-proto",
                 ))] {
                     (drv_stm32xx_sys_api::Port::C.pin(13), true)
+                } else if #[cfg(any(
+                    target_board = "micromod-g030",
+                ))] {
+                    (drv_stm32xx_sys_api::Port::C.pin(6), true)
                 } else {
                     (drv_stm32xx_sys_api::Port::A.pin(5), true)
                 }
