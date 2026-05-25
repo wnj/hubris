@@ -1,3 +1,3 @@
 FPGA images and collateral are generated from:
-[this sha](https://github.com/oxidecomputer/quartz/commit/0d094c19ea381fdf4aa8f0b0fc7e5f2a33a37506)
-[release](https://api.github.com/repos/oxidecomputer/quartz/releases/234047862)
+[this sha](https://github.com/oxidecomputer/quartz/commit/c685246c1a859f5a86103ae09c2e21bf4ec3a156)
+[release](https://api.github.com/repos/oxidecomputer/quartz/releases/294020239)

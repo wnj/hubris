@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use super::{retry_i2c_txn, I2cTxn};
+use super::{I2cTxn, retry_i2c_txn};
+use crate::Ereporter;
 ///
 /// We have seen adventures on the V12_SYS_A2 rail in that it will sag from
 /// 12V to ~8V over a period of about ~4ms, and then rise back 12V over ~7ms.
@@ -31,16 +32,16 @@ use crate::gpio_irq_pins::VCORE_TO_SP_ALERT_L;
 use drv_i2c_api::{I2cDevice, ResponseCode};
 use drv_i2c_devices::raa229618::Raa229618;
 use drv_stm32xx_sys_api as sys_api;
+use ereports::pwr::{PmbusAlert, PmbusStatus};
 use fixedstr::FixedStr;
 use ringbuf::*;
 use sys_api::IrqControl;
-use task_packrat_api as packrat_api;
 use userlib::{sys_get_timer, units};
 
 pub struct VCore {
     device: Raa229618,
+    faulted: bool,
     sys: sys_api::Sys,
-    packrat: packrat_api::Packrat,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -49,9 +50,19 @@ enum Trace {
     Initializing,
     Initialized,
     LimitLoaded,
-    FaultsCleared,
-    Notified { timestamp: u64, asserted: bool },
-    RegulatorStatus { power_good: bool, faulted: bool },
+    Notified {
+        timestamp: u64,
+        asserted: bool,
+    },
+    RegulatorStatus {
+        power_good: bool,
+        faulted: bool,
+    },
+    TriedToClearFaults {
+        status_word: Result<u16, ResponseCode>,
+        pmalert: bool,
+        cleared: Result<(), ResponseCode>,
+    },
     StatusWord(Result<u16, ResponseCode>),
     StatusInput(Result<u8, ResponseCode>),
     StatusVout(Result<u8, ResponseCode>),
@@ -59,22 +70,49 @@ enum Trace {
     StatusTemperature(Result<u8, ResponseCode>),
     StatusCml(Result<u8, ResponseCode>),
     StatusMfrSpecific(Result<u8, ResponseCode>),
-    Reading { timestamp: u64, volts: units::Volts },
+    Reading {
+        timestamp: u64,
+        volts: units::Volts,
+    },
     Error(ResponseCode),
-    EreportSent(usize),
-    EreportLost(usize, packrat_api::EreportWriteError),
-    EreportTooBig,
 }
 
 ringbuf!(Trace, 120, Trace::None);
 
 ///
-/// We are going to set our input undervoltage warn limit to be 11.75 volts.
+/// Limit value for input undervoltage *warnings*.
 /// Note that we will not fault if VIN goes below this (that is, we will not
 /// lose POWER_GOOD), but the part will indicate an input fault and pull
-/// PWR_CONT1_VCORE_TO_SP_ALERT_L low.
+/// on its PMBus alert pin.
 ///
-const VCORE_UV_WARN_LIMIT: units::Volts = units::Volts(11.75);
+/// * * *
+///
+/// Okay, so this number is actually a bit finnicky.  Per the RAA229618
+/// datasheet, in the documentation for the `VIN_UV_FAULT_RESPONSE` register,
+/// we find the following (emphasis mine):
+///
+/// > Configures the input undervoltage fault response. For a fault to be
+/// > considered cleared, **the input voltage must rise by 1/16th of the UV
+/// > fault threshold value.**
+/// >
+/// > --- R16DS0096EU0100 Rev.1.00 § 10.39, "VIN_UV_FAULT_RESPONSE" (p. 61)
+///
+/// While the documentation does not explicitly state that this also applies
+/// to *warnings* (and there is no corresponding `VIN_UV_WARN_RESPONSE`
+/// register, as the response is always just to assert the PMBus alert pin),
+/// it stands to reason that warnings would also only clear when voltage
+/// rises by 1/16th of the warning threshold value.  Empirical testing reveals
+/// that this is indeed the case.
+///
+/// So, the important thing here is that, when selecting a warning threshold,
+/// we must ensure that `lim + (1/16 * lim)` is less than the expected nominal
+/// input voltage, or else the warning will not clear even if the input voltage
+/// returns to nominal.
+///
+/// For a 12V input, 11V seems like a reasonable undervoltage warning limit.
+/// 1/16 * 11V = 0.6875V, so the warning will clear if the input voltage rises
+/// by at least 11.6875V.
+const VCORE_UV_WARN_LIMIT: units::Volts = units::Volts(11.0);
 
 ///
 /// We want to collect enough samples (at ~900µs per sample) to adequately
@@ -97,16 +135,11 @@ cfg_if::cfg_if! {
 }
 
 impl VCore {
-    pub fn new(
-        sys: &sys_api::Sys,
-        packrat: packrat_api::Packrat,
-        device: &I2cDevice,
-        rail: u8,
-    ) -> Self {
+    pub fn new(sys: &sys_api::Sys, device: &I2cDevice, rail: u8) -> Self {
         Self {
             device: Raa229618::new(device, rail),
+            faulted: false,
             sys: sys.clone(),
-            packrat,
         }
     }
 
@@ -114,22 +147,24 @@ impl VCore {
         crate::notifications::VCORE_MASK
     }
 
-    pub fn initialize_uv_warning(&self) -> Result<(), ResponseCode> {
+    pub fn initialize_uv_warning(&mut self) -> Result<(), ResponseCode> {
         let sys = &self.sys;
 
         ringbuf_entry!(Trace::Initializing);
+
+        // Set our alert line to be an input.
+        //
+        // We do this prior to calling `try_to_clear_faults`, as that function
+        // will attempt to read the alert line.
+        sys.gpio_configure_input(VCORE_TO_SP_ALERT_L, sys_api::Pull::None);
+        sys.gpio_irq_configure(self.mask(), sys_api::Edge::Falling);
 
         // Set our warn limit
         self.device.set_vin_uv_warn_limit(VCORE_UV_WARN_LIMIT)?;
         ringbuf_entry!(Trace::LimitLoaded);
 
         // Clear our faults
-        self.device.clear_faults()?;
-        ringbuf_entry!(Trace::FaultsCleared);
-
-        // Set our alert line to be an input
-        sys.gpio_configure_input(VCORE_TO_SP_ALERT_L, sys_api::Pull::None);
-        sys.gpio_irq_configure(self.mask(), sys_api::Edge::Falling);
+        self.try_to_clear_faults();
 
         // Enable the interrupt!
         let _ = self.sys.gpio_irq_control(self.mask(), IrqControl::Enable);
@@ -139,12 +174,9 @@ impl VCore {
         Ok(())
     }
 
-    pub fn handle_notification(
-        &self,
-        ereport_buf: &mut [u8; crate::EREPORT_BUF_LEN],
-    ) {
+    pub fn handle_notification(&mut self, ereporter: &mut Ereporter) {
         let now = sys_get_timer().now;
-        let asserted = self.sys.gpio_read(VCORE_TO_SP_ALERT_L) == 0;
+        let asserted = self.is_pmalert_asserted();
 
         ringbuf_entry!(Trace::Notified {
             timestamp: now,
@@ -152,24 +184,46 @@ impl VCore {
         });
 
         if asserted {
-            self.read_pmbus_status(now, ereport_buf);
+            // Don't produce another ereport if PMALERT_L was already asserted
+            // without being deasserted.
+            if !self.faulted {
+                self.read_pmbus_status(now, ereporter);
+            }
             // Clear the fault now so that PMALERT_L is reasserted if a
             // subsequent fault occurs. Note that if the fault *condition*
             // continues, the fault bits in the status registers will remain
             // set, and sending the CLEAR_FAULTS command does *not* cause the
             // device to power back on if it's off.
-            let _ = self.device.clear_faults();
-            ringbuf_entry!(Trace::FaultsCleared);
+            self.try_to_clear_faults();
         }
 
         let _ = self.sys.gpio_irq_control(self.mask(), IrqControl::Enable);
     }
 
-    fn read_pmbus_status(
-        &self,
-        now: u64,
-        ereport_buf: &mut [u8; crate::EREPORT_BUF_LEN],
-    ) {
+    pub fn is_faulted(&self) -> bool {
+        self.faulted
+    }
+
+    pub fn try_to_clear_faults(&mut self) {
+        let cleared = retry_i2c_txn(I2cTxn::VCoreClearFaults, || {
+            self.device.clear_faults_on_all_rails()
+        });
+        let pmalert = self.is_pmalert_asserted();
+        self.faulted = pmalert;
+        let status_word =
+            self.device.status_word().map(|s| s.0).map_err(Into::into);
+        ringbuf_entry!(Trace::TriedToClearFaults {
+            cleared,
+            pmalert,
+            status_word
+        })
+    }
+
+    fn is_pmalert_asserted(&self) -> bool {
+        self.sys.gpio_read(VCORE_TO_SP_ALERT_L) == 0
+    }
+
+    fn read_pmbus_status(&self, now: u64, ereporter: &mut Ereporter) {
         use pmbus::commands::raa229618::STATUS_WORD;
 
         // Read PMBus status registers and prepare an ereport.
@@ -264,7 +318,7 @@ impl VCore {
             .map(|s| s.0);
         ringbuf_entry!(Trace::StatusMfrSpecific(status_mfr_specific));
 
-        let status = super::PmbusStatus {
+        let status = PmbusStatus {
             word: status_word.map(|s| s.0).ok(),
             input: status_input.ok(),
             vout: status_vout.ok(),
@@ -274,29 +328,17 @@ impl VCore {
             mfr: status_mfr_specific.ok(),
         };
 
-        static RAIL: FixedStr<9> = FixedStr::from_str("VDD_VCORE");
-        let ereport = packrat_api::Ereport {
-            class: crate::EreportClass::PmbusAlert,
-            version: 0,
-            report: crate::EreportKind::PmbusAlert {
-                refdes: FixedStr::from_str(
-                    self.device.i2c_device().component_id(),
-                ),
-                rail: &RAIL,
-                time: now,
-                pwr_good,
-                pmbus_status: status,
-            },
+        static RAIL: FixedStr<'static, 9> = FixedStr::from_str("VDD_VCORE");
+        let ereport = PmbusAlert {
+            refdes: FixedStr::<{ crate::REFDES_LEN }>::from_str(
+                self.device.i2c_device().component_id(),
+            ),
+            rail: RAIL,
+            time: now,
+            pwr_good,
+            pmbus_status: status,
         };
-        match self.packrat.encode_ereport(&ereport, &mut ereport_buf[..]) {
-            Ok(len) => ringbuf_entry!(Trace::EreportSent(len)),
-            Err(task_packrat_api::EreportEncodeError::Packrat { len, err }) => {
-                ringbuf_entry!(Trace::EreportLost(len, err))
-            }
-            Err(task_packrat_api::EreportEncodeError::Encoder(_)) => {
-                ringbuf_entry!(Trace::EreportTooBig)
-            }
-        }
+        let _ = ereporter.deliver_ereport(&ereport);
         // TODO(eliza): if POWER_GOOD has been deasserted, we should produce a
         // subsequent ereport for that.
 

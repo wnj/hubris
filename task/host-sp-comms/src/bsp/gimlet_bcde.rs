@@ -5,7 +5,7 @@
 //! SP inventory types and implementation
 //!
 //! This reduces clutter in the main `ServerImpl` implementation
-use super::{inventory::by_refdes, ServerImpl};
+use super::{ServerImpl, inventory::by_refdes};
 
 use drv_i2c_api::I2cDevice;
 use drv_spi_api::SpiServer;
@@ -141,7 +141,7 @@ impl ServerImpl {
                     temp_sensor: sensors.temperature.into(),
                     voltage_sensor: sensors.voltage.into(),
                     current_sensor: sensors.current.into(),
-                    power_sensor: sensors.power.into(),
+                    power_sensor: u32::MAX, // not present
                 };
                 self.tx_buf.try_encode_inventory(sequence, name, || {
                     use pmbus::commands::bmr491::CommandCode;
@@ -540,7 +540,7 @@ impl ServerImpl {
             // We need to specify INVENTORY_COUNT individually here to trigger
             // an error if we've overlapped it with a previous range
             Self::INVENTORY_COUNT | Self::INVENTORY_COUNT..=u32::MAX => {
-                return Err(InventoryDataResult::InvalidIndex)
+                return Err(InventoryDataResult::InvalidIndex);
             }
         }
 

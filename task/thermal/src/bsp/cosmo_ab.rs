@@ -15,7 +15,7 @@ pub use drv_cpu_seq_api::SeqError;
 use drv_cpu_seq_api::{PowerState, Sequencer, StateChangeReason};
 use task_sensor_api::SensorId;
 use task_thermal_api::ThermalProperties;
-use userlib::{task_slot, units::Celsius, TaskId, UnwrapLite};
+use userlib::{TaskId, UnwrapLite, task_slot, units::Celsius};
 
 task_slot!(SEQ, cosmo_seq);
 
@@ -66,7 +66,10 @@ bitflags::bitflags! {
         // in A2; you probably want to use `A0_OR_A2` instead.
         const A2 = 0b00000001;
         const A0 = 0b00000010;
-        const A0_OR_A2 = Self::A0.bits() | Self::A2.bits();
+        // A0+HP: T6 power is enabled by the host processor, in addition to
+        // all A0 devices.
+        const T6 = 0b00000100;
+        const A0_PLUS_HP = Self::A0.bits() | Self::T6.bits();
     }
 }
 
@@ -97,9 +100,8 @@ impl Bsp {
 
     pub fn power_mode(&self) -> PowerBitmask {
         match self.seq.get_state() {
-            PowerState::A0PlusHP | PowerState::A0 | PowerState::A0Reset => {
-                PowerBitmask::A0
-            }
+            PowerState::A0PlusHP => PowerBitmask::A0_PLUS_HP,
+            PowerState::A0 | PowerState::A0Reset => PowerBitmask::A0,
             PowerState::A2
             | PowerState::A2PlusFans
             | PowerState::A0Thermtrip => PowerBitmask::A2,
@@ -135,9 +137,9 @@ impl Bsp {
             // Based on experimental tuning!
             pid_config: PidConfig {
                 zero: 35.0,
-                gain_p: 1.75,
+                gain_p: 5.0,
                 gain_i: 0.0135,
-                gain_d: 0.4,
+                gain_d: 5.0,
                 min_output: 0.0,
                 max_output: 100.0,
             },
@@ -190,11 +192,12 @@ const CPU_THERMALS: ThermalProperties = ThermalProperties {
     temperature_slew_deg_per_sec: 0.5,
 };
 
-// The T6's specifications aren't clearly detailed anywhere.
+// According to Chelsio, T_j Max is 115°C, while T_j Typical is 100° C. Let's
+// try to stay below 100°C.
 const T6_THERMALS: ThermalProperties = ThermalProperties {
-    target_temperature: Celsius(70f32),
-    critical_temperature: Celsius(80f32),
-    power_down_temperature: Celsius(85f32),
+    target_temperature: Celsius(95f32),
+    critical_temperature: Celsius(100f32),
+    power_down_temperature: Celsius(115f32),
     temperature_slew_deg_per_sec: 0.5,
 };
 
@@ -236,7 +239,9 @@ const INPUTS: [InputChannel; NUM_TEMPERATURE_INPUTS] = [
             sensors::TMP451_T6_TEMPERATURE_SENSOR,
         ),
         T6_THERMALS,
-        PowerBitmask::A0,
+        // Enabled only if we are in the A0+HP power state, as T6 power is
+        // controlled by the host OS.
+        PowerBitmask::T6,
         ChannelType::MustBePresent,
     ),
     // U.2 drives

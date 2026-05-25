@@ -13,30 +13,38 @@
 //!
 
 use super::i2c_config;
+use crate::Ereporter;
 use drv_i2c_api::ResponseCode;
 use drv_i2c_devices::raa229620a::{self, Raa229620A};
+use ereports::pwr::{PmbusAlert, PmbusStatus};
+use fixedstr::FixedStr;
+use pmbus::commands::raa229620a::STATUS_CML;
+use pmbus::commands::raa229620a::STATUS_IOUT;
+use pmbus::commands::raa229620a::STATUS_WORD;
 use ringbuf::*;
-use serde::Serialize;
-use userlib::{sys_get_timer, units, TaskId};
+use userlib::{TaskId, sys_get_timer, units};
 
 pub(super) struct VCore {
     /// `PWR_CONT1`: This regulator controls `VDDCR_CPU0` and `VDDCR_SOC` rails.
     vddcr_cpu0: Raa229620A,
     /// `PWR_CONT2`: This regulator controls `VDDCR_CPU1` and `VDDIO_SP5` rails.
     vddcr_cpu1: Raa229620A,
-    packrat: task_packrat_api::Packrat,
+    faulted: Vrms,
 }
 
-#[derive(Copy, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-enum Rail {
+#[derive(Copy, Clone, PartialEq, microcbor::Encode)]
+pub(crate) enum Rail {
+    #[cbor(rename = "VDDCR_CPU0_A0")]
     VddcrCpu0,
+    #[cbor(rename = "VDDCR_CPU1_A0")]
     VddcrCpu1,
 }
 
 #[derive(Copy, Clone, PartialEq)]
 enum PmbusCmd {
     LoadLimit,
+    SetStatusIoutMask,
+    SetStatusCmlMask,
     ClearFaults,
     ReadVin,
     Status,
@@ -47,11 +55,18 @@ enum Trace {
     None,
     Initializing,
     Initialized,
-    LimitsLoaded,
-    FaultsCleared(Rails),
+    LimitsLoaded {
+        all_ok: bool,
+    },
+    StatusIoutMaskSet {
+        all_ok: bool,
+    },
+    StatusCmlMaskSet {
+        all_ok: bool,
+    },
     PmbusAlert {
         timestamp: u64,
-        rails: Rails,
+        alerted: Vrms,
     },
     Reading {
         timestamp: u64,
@@ -63,6 +78,10 @@ enum Trace {
         power_good: bool,
         faulted: bool,
     },
+    TriedToClearFaults {
+        vddcr_cpu0: Status,
+        vddcr_cpu1: Status,
+    },
     StatusWord(Rail, Result<u16, ResponseCode>),
     StatusInput(Rail, Result<u8, ResponseCode>),
     StatusVout(Rail, Result<u8, ResponseCode>),
@@ -71,26 +90,92 @@ enum Trace {
     StatusCml(Rail, Result<u8, ResponseCode>),
     StatusMfrSpecific(Rail, Result<u8, ResponseCode>),
     I2cError(Rail, PmbusCmd, raa229620a::Error),
-    EreportSent(Rail, usize),
-    EreportLost(Rail, usize, task_packrat_api::EreportWriteError),
-    EreportTooBig(Rail),
 }
 
 #[derive(Copy, Clone, PartialEq)]
-pub struct Rails {
-    pub vddcr_cpu0: bool,
-    pub vddcr_cpu1: bool,
+enum Status {
+    NotFaulted,
+    // This is on purpose; Humility will display the ringbuf entry as just the
+    // name of the variant, without the enum name.
+    #[allow(clippy::enum_variant_names)]
+    StatusWord(u16),
+    I2cError(ResponseCode),
+}
+
+impl Status {
+    fn from_result(
+        result: Result<STATUS_WORD::CommandData, ResponseCode>,
+    ) -> Self {
+        match result {
+            Ok(s) => Status::StatusWord(s.0),
+            Err(e) => Status::I2cError(e),
+        }
+    }
+
+    fn is_faulted(&self) -> bool {
+        match self {
+            Status::NotFaulted => false,
+            Status::StatusWord(word) => {
+                // Mask out the "off" bit, as "off" is not a fault.
+                //
+                // This is unfortunately the least annoying way to implement
+                // "test if any bits _other_ than this one are set" in the
+                // `pmbus` crate's current API...
+                let off_mask = {
+                    let mut mask = STATUS_WORD::CommandData(0);
+                    mask.set_off(STATUS_WORD::Off::PowerOff);
+                    !mask.0
+                };
+                // Any other `STATUS_WORD` bits indicate a fault.
+                word & off_mask != 0
+            }
+            Status::I2cError(_) => true,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq)]
+pub struct Vrms {
+    pub pwr_cont1: bool,
+    pub pwr_cont2: bool,
 }
 
 ringbuf!(Trace, 60, Trace::None);
 
 ///
-/// We are going to set our input undervoltage warn limit to be 11.75 volts.
+/// Limit value for input undervoltage *warnings*.
 /// Note that we will not fault if VIN goes below this (that is, we will not
 /// lose POWER_GOOD), but the part will indicate an input fault and pull
 /// on its PMBus alert pin.
 ///
-const VCORE_UV_WARN_LIMIT: units::Volts = units::Volts(11.75);
+/// * * *
+///
+/// Okay, so this number is actually a bit finnicky.  Per the RAA22960A
+/// datasheet, in the documentation for the `VIN_UV_FAULT_RESPONSE` register,
+/// we find the following (emphasis mine):
+///
+/// > Configures the input undervoltage fault response. For a fault to be
+/// > considered cleared, **the input voltage must rise by 1/16th of the UV
+/// > fault threshold value.**
+/// >
+/// > --- R16DS0309EU0100 Rev.1.00 § 11.36, "VIN_UV_FAULT_RESPONSE" (p. 57)
+///
+/// While the documentation does not explicitly state that this also applies
+/// to *warnings* (and there is no corresponding `VIN_UV_WARN_RESPONSE`
+/// register, as the response is always just to assert the PMBus alert pin),
+/// it stands to reason that warnings would also only clear when voltage
+/// rises by 1/16th of the warning threshold value.  Empirical testing reveals
+/// that this is indeed the case.
+///
+/// So, the important thing here is that, when selecting a warning threshold,
+/// we must ensure that `lim + (1/16 * lim)` is less than the expected nominal
+/// input voltage, or else the warning will not clear even if the input voltage
+/// returns to nominal.
+///
+/// For a 12V input, 11V seems like a reasonable undervoltage warning limit.
+/// 1/16 * 11V = 0.6875V, so the warning will clear if the input voltage rises
+/// by at least 11.6875V.
+const VCORE_UV_WARN_LIMIT: units::Volts = units::Volts(11.0);
 
 ///
 /// We want to collect enough samples (at ~900µs per sample per regulator, or
@@ -104,91 +189,204 @@ const VCORE_UV_WARN_LIMIT: units::Volts = units::Volts(11.75);
 const VCORE_NSAMPLES: usize = 25;
 
 impl VCore {
-    pub fn new(i2c: TaskId, packrat: task_packrat_api::Packrat) -> Self {
+    pub fn new(i2c: TaskId) -> Self {
         let (device, rail) = i2c_config::pmbus::vddcr_cpu0_a0(i2c);
         let vddcr_cpu0 = Raa229620A::new(&device, rail);
 
         let (device, rail) = i2c_config::pmbus::vddcr_cpu1_a0(i2c);
         let vddcr_cpu1 = Raa229620A::new(&device, rail);
+
         Self {
             vddcr_cpu0,
             vddcr_cpu1,
-            packrat,
+            faulted: Vrms {
+                pwr_cont1: false,
+                pwr_cont2: false,
+            },
         }
     }
 
-    pub fn initialize_uv_warning(&self) -> Result<(), ResponseCode> {
+    pub fn is_still_faulted(&self) -> bool {
+        self.faulted.pwr_cont1 || self.faulted.pwr_cont2
+    }
+
+    pub fn initialize_pmbus_alerts(&mut self) {
         ringbuf_entry!(Trace::Initializing);
 
+        // Yes, we just ignore errors here --- that may seem a bit sketchy, but
+        // what else can we do? It seems pretty bad to panic and say "nope, the
+        // computer won't turn on" because we weren't able to do an I2C
+        // transaction to turn on an interrupt that we only use for monitoring.
+        // Each step will retry internally a few times, so we should power
+        // through any transient I2C messiness, and any I2C errors that occur
+        // get logged in the ringbuf. We also do *not* bail out early if any
+        // other step fails, because we would still like to do every other thing
+        // if possible.
+
         // Set our warn limit
-        retry_i2c_txn(Rail::VddcrCpu0, PmbusCmd::LoadLimit, || {
-            self.vddcr_cpu0.set_vin_uv_warn_limit(VCORE_UV_WARN_LIMIT)
-        })?;
-        retry_i2c_txn(Rail::VddcrCpu1, PmbusCmd::LoadLimit, || {
-            self.vddcr_cpu1.set_vin_uv_warn_limit(VCORE_UV_WARN_LIMIT)
-        })?;
-        ringbuf_entry!(Trace::LimitsLoaded);
+        let all_ok = self
+            .set_alert_config_on_both_vrms(PmbusCmd::LoadLimit, |vrm| {
+                vrm.set_vin_uv_warn_limit(VCORE_UV_WARN_LIMIT)
+            });
+        ringbuf_entry!(Trace::LimitsLoaded { all_ok });
+
+        let iout_mask = {
+            let mut mask = STATUS_IOUT::CommandData(0);
+            // Mask out SMBus alerts for output overcurrent warnings on the
+            // RAA229620A. This is necessary because the AMD power design
+            // guidelines for Turin require that the SVI3 fast overcurrent
+            // response warning threshold be 90% of the EDC for the CPU, which
+            // results in the VRMs asserting output overcurrent warnings on
+            // their SVI3 rail during normal operation of the CPU. AMD
+            // recommends that these warnings be masked out and/or ignored, so
+            // we disable them here.
+            //
+            // We don't expect to see overcurrent warnings on non-SVI3 rails, as
+            // the default value of the PMBus `IOUT_OC_WARN_LIMIT` register
+            // on the RAA229620A is 3000A, which is *well above* the overcurrent
+            // *fault* threshold.
+            mask.set_output_overcurrent_warning(
+                STATUS_IOUT::OutputOvercurrentWarning::Warning,
+            );
+            mask
+        };
+        let all_ok = self.set_alert_config_on_both_vrms(
+            PmbusCmd::SetStatusIoutMask,
+            |vrm| vrm.set_status_iout_smbalert_mask(iout_mask),
+        );
+        ringbuf_entry!(Trace::StatusIoutMaskSet { all_ok });
+
+        let cml_mask = {
+            let mut mask = STATUS_CML::CommandData(0);
+            // Mask out SMBus alerts for STATUS_CML bit 1. This bit, "other
+            // fault", is basically set when the PMBus sees something happen on
+            // the I2C bus that makes it feel weird. Unfortunately, it turns out
+            // that "I2C things that make you feel kinda weird" can happen a lot
+            // in an otherwise healthy system. While we are thankful for the
+            // RAA229620A for setting the status bit that says it saw something
+            // weird, we would really rather not get an IRQ about it every time
+            // there's I2C weather. So let's not get alerts for this one.
+            mask.set_other_communication_error(
+                STATUS_CML::OtherCommunicationError::Error,
+            );
+            mask
+        };
+        let all_ok = self
+            .set_alert_config_on_both_vrms(PmbusCmd::SetStatusCmlMask, |vrm| {
+                vrm.set_status_cml_smbalert_mask_on_all_rails(cml_mask)
+            });
+        ringbuf_entry!(Trace::StatusCmlMaskSet { all_ok });
 
         // Clear our faults
-        self.clear_faults(Rails {
-            vddcr_cpu0: true,
-            vddcr_cpu1: true,
-        })?;
+        self.try_to_clear_faults(Vrms {
+            pwr_cont1: true,
+            pwr_cont2: true,
+        });
 
         // The higher-level sequencer code will unmask the FPGA interrupts for
         // our guys.
 
         ringbuf_entry!(Trace::Initialized);
-
-        Ok(())
     }
 
-    pub fn clear_faults(&self, which_rails: Rails) -> Result<(), ResponseCode> {
-        if which_rails.vddcr_cpu0 {
-            retry_i2c_txn(Rail::VddcrCpu0, PmbusCmd::ClearFaults, || {
-                self.vddcr_cpu0.clear_faults()
+    fn set_alert_config_on_both_vrms(
+        &self,
+        which: PmbusCmd,
+        txn: impl Fn(&Raa229620A) -> Result<(), raa229620a::Error>,
+    ) -> bool {
+        let mut all_ok = true;
+        all_ok &=
+            retry_i2c_txn(
+                Rail::VddcrCpu0,
+                which,
+                &mut || txn(&self.vddcr_cpu0),
+            )
+            .is_ok();
+        all_ok &=
+            retry_i2c_txn(
+                Rail::VddcrCpu1,
+                which,
+                &mut || txn(&self.vddcr_cpu1),
+            )
+            .is_ok();
+        all_ok
+    }
+
+    pub fn can_we_unmask_any_vrm_irqs_again(&mut self) -> Vrms {
+        self.try_to_clear_faults(self.faulted);
+        Vrms {
+            pwr_cont1: !self.faulted.pwr_cont1,
+            pwr_cont2: !self.faulted.pwr_cont2,
+        }
+    }
+
+    fn try_to_clear_faults(&mut self, which_vrms: Vrms) {
+        fn clear_faults(
+            rail: Rail,
+            dev: &Raa229620A,
+        ) -> Result<STATUS_WORD::CommandData, ResponseCode> {
+            retry_i2c_txn(rail, PmbusCmd::ClearFaults, || {
+                dev.clear_faults_on_all_rails()
             })?;
+            Ok(dev.status_word()?)
         }
 
-        if which_rails.vddcr_cpu1 {
-            retry_i2c_txn(Rail::VddcrCpu1, PmbusCmd::ClearFaults, || {
-                self.vddcr_cpu1.clear_faults()
-            })?;
-        }
+        let vddcr_cpu0 = if which_vrms.pwr_cont1 {
+            Status::from_result(clear_faults(Rail::VddcrCpu0, &self.vddcr_cpu0))
+        } else {
+            Status::NotFaulted
+        };
 
-        ringbuf_entry!(Trace::FaultsCleared(which_rails));
+        let vddcr_cpu1 = if which_vrms.pwr_cont2 {
+            Status::from_result(clear_faults(Rail::VddcrCpu1, &self.vddcr_cpu1))
+        } else {
+            Status::NotFaulted
+        };
 
-        Ok(())
+        ringbuf_entry!(Trace::TriedToClearFaults {
+            vddcr_cpu0,
+            vddcr_cpu1
+        });
+
+        self.faulted.pwr_cont1 = vddcr_cpu0.is_faulted();
+        self.faulted.pwr_cont2 = vddcr_cpu1.is_faulted();
     }
 
     pub fn handle_pmbus_alert(
-        &self,
-        mut rails: Rails,
+        &mut self,
+        vrms: Vrms,
         now: u64,
-        ereport_buf: &mut [u8],
+        ereporter: &mut Ereporter,
     ) {
         ringbuf_entry!(Trace::PmbusAlert {
             timestamp: now,
-            rails,
+            alerted: vrms,
         });
 
-        let cpu0_state = self.record_pmbus_status(
-            now,
-            Rail::VddcrCpu0,
-            rails.vddcr_cpu0,
-            ereport_buf,
-        );
-        rails.vddcr_cpu0 |= cpu0_state.faulted;
+        let mut input_fault = false;
+        if !self.faulted.pwr_cont1 {
+            let state = self.record_pmbus_status(
+                now,
+                Rail::VddcrCpu0,
+                vrms.pwr_cont1,
+                ereporter,
+            );
+            input_fault |= state.input_fault;
+            self.faulted.pwr_cont1 |= state.faulted;
+        }
 
-        let cpu1_state = self.record_pmbus_status(
-            now,
-            Rail::VddcrCpu1,
-            rails.vddcr_cpu1,
-            ereport_buf,
-        );
-        rails.vddcr_cpu1 |= cpu1_state.faulted;
+        if !self.faulted.pwr_cont2 {
+            let state = self.record_pmbus_status(
+                now,
+                Rail::VddcrCpu1,
+                vrms.pwr_cont2,
+                ereporter,
+            );
+            input_fault |= state.input_fault;
+            self.faulted.pwr_cont2 |= state.faulted;
+        }
 
-        if cpu0_state.input_fault || cpu1_state.input_fault {
+        if input_fault {
             for _ in 0..VCORE_NSAMPLES {
                 let vddcr_cpu0_vin =
                     self.vddcr_cpu0.read_vin().unwrap_or_else(|e| {
@@ -216,7 +414,7 @@ impl VCore {
                 //
                 // Record our readings, along with a timestamp. On the one hand,
                 // it's a little exceesive to record a timestamp on every
-                // reading: it's in milliseconds, and because it takes ~900µs
+                // reading: it's in milliseconds, and because it takes ~900µs``ws
                 // per reading (so ~1800us to read from both regulators), we
                 // expect the timestamp to (basically) be incremented by 2 with
                 // every reading (with a duplicate timestamp occuring every ~7-9
@@ -233,24 +431,6 @@ impl VCore {
                 });
             }
         }
-
-        // The only way to make the pins deassert (and thus, the IRQ go
-        // away) is to tell the guys to clear the fault.
-        // N.B.: unlike other FPGA sequencer alerts, we need not clear the
-        // IFR bits for these; they are hot as long as the PMALERT pin from
-        // the RAA229620As is asserted.
-        //
-        // Per the RAA229620A datasheet (R16DS0309EU0200 Rev.2.00, page 36),
-        // clearing the fault in the regulator will deassert PMALERT_L,
-        // releasing the IRQ, but the fault bits to be reset if the fault
-        // condition still exists. Note that this does *not* cause the device to
-        // restart if it has shut down. The behavior of "CLEAR_FAULTS" is really
-        // much closer to "ACKNOWLEDGE_PMBUS_ALERT", since it doesn't actually
-        // seem to effect the state of the regulator.
-        //
-        // TODO(eliza): we will want to handle a shut down regulator more
-        // intelligently in future...
-        let _ = self.clear_faults(rails);
     }
 
     fn record_pmbus_status(
@@ -258,7 +438,7 @@ impl VCore {
         now: u64,
         rail: Rail,
         alerted: bool,
-        ereport_buf: &mut [u8],
+        ereporter: &mut Ereporter,
     ) -> RegulatorState {
         use pmbus::commands::raa229620a::STATUS_WORD;
 
@@ -376,27 +556,16 @@ impl VCore {
             mfr: status_mfr.ok(),
         };
 
-        let ereport = Ereport {
-            k: "hw.pwr.pmbus.alert",
-            v: 0,
+        let ereport = PmbusAlert {
             rail,
-            refdes: device.i2c_device().component_id(),
+            refdes: FixedStr::<{ crate::REFDES_LEN }>::from_str(
+                device.i2c_device().component_id(),
+            ),
             time: now,
             pmbus_status,
             pwr_good: power_good,
         };
-        match self.packrat.serialize_ereport(&ereport, ereport_buf) {
-            Ok(len) => ringbuf_entry!(Trace::EreportSent(rail, len)),
-            Err(task_packrat_api::EreportSerializeError::Packrat {
-                len,
-                err,
-            }) => {
-                ringbuf_entry!(Trace::EreportLost(rail, len, err))
-            }
-            Err(task_packrat_api::EreportSerializeError::Serialize(_)) => {
-                ringbuf_entry!(Trace::EreportTooBig(rail))
-            }
-        }
+        let _ = ereporter.deliver_ereport(&ereport);
         // TODO(eliza): if POWER_GOOD has been deasserted, we should produce a
         // subsequent ereport for that.
 
@@ -405,28 +574,6 @@ impl VCore {
             input_fault,
         }
     }
-}
-
-#[derive(Serialize)]
-struct Ereport {
-    k: &'static str,
-    v: usize,
-    refdes: &'static str,
-    rail: Rail,
-    time: u64,
-    pwr_good: Option<bool>,
-    pmbus_status: PmbusStatus,
-}
-
-#[derive(Copy, Clone, Default, Serialize)]
-struct PmbusStatus {
-    word: Option<u16>,
-    input: Option<u8>,
-    iout: Option<u8>,
-    vout: Option<u8>,
-    temp: Option<u8>,
-    cml: Option<u8>,
-    mfr: Option<u8>,
 }
 
 struct RegulatorState {

@@ -16,7 +16,7 @@ mod serdes10g;
 mod serdes1g;
 
 use crate::config::{PortConfig, PortDev, PortMap, PortMode, PortSerdes};
-use userlib::{hl::sleep_for, UnwrapLite};
+use userlib::{UnwrapLite, hl::sleep_for};
 use vsc7448_pac::{types::RegisterAddress, *};
 
 pub use config::Speed;
@@ -110,6 +110,22 @@ pub struct Vsc7448<'a, R> {
     pub rw: &'a mut R,
     refclk_1: RefClockFreq,
     refclk_2: Option<RefClockFreq>,
+}
+
+/// Selects which SPs should be accessible from tech ports with unlocked VLANs
+#[derive(Copy, Clone, serde::Serialize, serde::Deserialize)]
+pub enum VlanTargets {
+    /// Every SP should be accessible from the tech port
+    ///
+    /// This is the typical unlocked behavior
+    EverySp,
+
+    /// Only Scrimlet SPs should be accessible from the tech port
+    ///
+    /// If cubbies are populated with loopback connections (instead of sleds),
+    /// this behavior prevents network loops; otherwise, packets can enter one
+    /// tech port and exit the other.
+    ScrimletOnly,
 }
 
 impl<R: Vsc7448Rw> Vsc7448Rw for Vsc7448<'_, R> {
@@ -725,10 +741,17 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
             if let Some(mask) = f(p) {
                 // Configure the 0x1YY VLAN, using our closure to decide what
                 // mask to apply
-                self.write_port_mask(
-                    ANA_L3().VLAN(0x100 + p as u16).VLAN_MASK_CFG(),
-                    mask,
-                )?;
+                let vid = 0x100 + p as u16;
+                self.write_port_mask(ANA_L3().VLAN(vid).VLAN_MASK_CFG(), mask)?;
+
+                // Configure the VLAN so that the classified VID is also copied
+                // to the FID ("filtering ID") field in packet metadata.  The
+                // FID is used as part of the MAC table entry (along with the
+                // source MAC), so this is necessary to make the MAC tables
+                // VLAN-aware.
+                self.write_with(ANA_L3().VLAN(vid).VLAN_CFG(), |r| {
+                    r.set_vlan_fid(u32::from(vid))
+                })?;
             }
         }
         Ok(())
@@ -866,8 +889,11 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
     ///
     /// To switch between locked and unlocked later, use
     /// `sidecar_vlan_lock/unlock` (instead of calling this function again)
-    pub fn configure_vlan_sidecar_unlocked(&self) -> Result<(), VscError> {
-        self.sidecar_vlan_unlock()?;
+    pub fn configure_vlan_sidecar_unlocked(
+        &self,
+        targets: VlanTargets,
+    ) -> Result<(), VscError> {
+        self.sidecar_vlan_unlock(targets)?;
         self.configure_port_tagged(|p| {
             p == sidecar::UPLINK || p == sidecar::LOCAL_SP
         })?;
@@ -891,11 +917,22 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
         })
     }
 
-    /// Configures the VLANs to the unlocked state, per RFD 492
+    /// Configures the VLANs to an unlocked state, selected by `VlanTargets`
+    pub fn sidecar_vlan_unlock(
+        &self,
+        targets: VlanTargets,
+    ) -> Result<(), VscError> {
+        match targets {
+            VlanTargets::EverySp => self.sidecar_vlan_unlock_all(),
+            VlanTargets::ScrimletOnly => self.sidecar_vlan_unlock_scrimlet(),
+        }
+    }
+
+    /// Configures the VLANs to the standard unlocked state, per RFD 492
     ///
     /// The technician ports can talk to any SP; SPs may talk to the Tofino or
     /// to the technician ports.
-    pub fn sidecar_vlan_unlock(&self) -> Result<(), VscError> {
+    fn sidecar_vlan_unlock_all(&self) -> Result<(), VscError> {
         self.configure_vlans(|p| match p {
             sidecar::UPLINK => None,
             sidecar::TECHNICIAN_1 => {
@@ -915,6 +952,37 @@ impl<'a, R: Vsc7448Rw> Vsc7448<'a, R> {
                         | (1 << sidecar::TECHNICIAN_2),
                 )
             }
+        })
+    }
+
+    /// Configures the VLANs to an unlocked state with only Scrimlets accessible
+    ///
+    /// This state is useful for racks with the Reverso™ board installed, which
+    /// loops back the two backplane connections within a cubby.  In this
+    /// configuration, we don't want for technician ports to communicate with
+    /// cubbies (other than Scrimlets), because that creates a routing loop
+    /// (packets can enter via one tech port and leave via the other).
+    fn sidecar_vlan_unlock_scrimlet(&self) -> Result<(), VscError> {
+        self.configure_vlans(|p| match p {
+            sidecar::UPLINK => None,
+            // Technician ports connect to uplink, scrimlets, and sidecar SPs
+            sidecar::TECHNICIAN_1 | sidecar::TECHNICIAN_2 => Some(
+                (1 << p)
+                    | (1 << sidecar::UPLINK)
+                    | (1 << sidecar::CUBBY_14)
+                    | (1 << sidecar::CUBBY_16)
+                    | (1 << sidecar::LOCAL_SP),
+            ),
+            // Scrimlet and Sidecar SPs are the only things connected to the
+            // technician ports (and are also connected to the Tofino, as usual)
+            sidecar::CUBBY_14 | sidecar::CUBBY_16 | sidecar::LOCAL_SP => Some(
+                (1 << p)
+                    | (1 << sidecar::UPLINK)
+                    | (1 << sidecar::TECHNICIAN_1)
+                    | (1 << sidecar::TECHNICIAN_2),
+            ),
+            // Other SPs are only connected to the Tofino uplink port
+            _ => Some((1 << p) | (1 << sidecar::UPLINK)),
         })
     }
 
@@ -966,6 +1034,12 @@ mod sidecar {
 
     /// Technician port 2 (front IO board)
     pub const TECHNICIAN_2: u8 = 45;
+
+    /// Scrimlet 1
+    pub const CUBBY_14: u8 = 8;
+
+    /// Scrimlet 2
+    pub const CUBBY_16: u8 = 4;
 }
 
 mod minibar {

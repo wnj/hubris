@@ -3,20 +3,21 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::{
-    mgs_common::MgsCommon, update::rot::RotUpdate, update::sp::SpUpdate,
-    update::ComponentUpdater, usize_max, CriticalEvent, Log, MgsMessage,
+    CriticalEvent, Log, MgsMessage, mgs_common::MgsCommon,
+    update::ComponentUpdater, update::rot::RotUpdate, update::sp::SpUpdate,
+    usize_max,
 };
 use drv_user_leds_api::UserLeds;
 use gateway_messages::sp_impl::{
     BoundsChecked, DeviceDescription, Sender, SpHandler,
 };
 use gateway_messages::{
-    ignition, ComponentAction, ComponentActionResponse, ComponentDetails,
+    ComponentAction, ComponentActionResponse, ComponentDetails,
     ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask,
     IgnitionCommand, IgnitionState, MgsError, MgsRequest, MgsResponse,
     PowerState, PowerStateTransition, RotBootInfo, RotRequest, RotResponse,
     SensorRequest, SensorResponse, SpComponent, SpError, SpStateV2,
-    SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
+    SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus, ignition,
 };
 use host_sp_messages::HostStartupOptions;
 use idol_runtime::{Leased, RequestError};
@@ -444,7 +445,13 @@ impl SpHandler for MgsHandler {
             component
         }));
 
-        self.common.inventory().num_component_details(&component)
+        self.common.inventory().num_component_details(
+            &component,
+            |_component| {
+                // Nothing in OUR_DEVICES has component details
+                0
+            },
+        )
     }
 
     fn component_details(
@@ -488,6 +495,17 @@ impl SpHandler for MgsHandler {
 
         self.common
             .component_set_active_slot(component, slot, persist)
+    }
+
+    fn component_get_persistent_slot(
+        &mut self,
+        component: SpComponent,
+    ) -> Result<u16, SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::ComponentGetPersistentSlot { component }
+        ));
+
+        self.common.component_get_persistent_slot(component)
     }
 
     fn component_clear_status(

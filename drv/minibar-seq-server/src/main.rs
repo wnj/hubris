@@ -9,18 +9,18 @@
 
 use drv_auxflash_api::AuxFlash;
 use drv_fpga_api::{
-    await_fpga_ready, BitstreamType, DeviceState, Fpga, FpgaError,
-    FpgaUserDesign, FpgaUserDesignIdent, WriteOp,
+    BitstreamType, DeviceState, Fpga, FpgaError, FpgaUserDesign,
+    FpgaUserDesignIdent, WriteOp, await_fpga_ready,
 };
 use drv_minibar_seq_api::{
-    Addr, MinibarSeqError, Reg, MINIBAR_BITSTREAM_CHECKSUM,
+    Addr, MINIBAR_BITSTREAM_CHECKSUM, MinibarSeqError, Reg,
 };
-use drv_packrat_vpd_loader::{read_vpd_and_load_packrat, Packrat};
+use drv_packrat_vpd_loader::{Packrat, read_vpd_and_load_packrat};
 
 use idol_runtime::{NotificationHandler, RequestError};
 use ringbuf::{ringbuf, ringbuf_entry};
 use userlib::{
-    sys_get_timer, sys_set_timer, task_slot, RecvMessage, UnwrapLite,
+    RecvMessage, UnwrapLite, sys_get_timer, sys_set_timer, task_slot,
 };
 
 task_slot!(I2C, i2c_driver);
@@ -136,6 +136,38 @@ impl ServerImpl {
         Reg::VBUS_SLED::StateEncoded::try_from(raw)
             .map_err(|_| FpgaError::InvalidValue)
     }
+
+    pub fn get_v12_pcie_status(
+        &self,
+    ) -> Result<Reg::V12_PCIE::StateEncoded, FpgaError> {
+        let raw: u8 = self.fpga_user.read(Addr::V12_PCIE)?;
+
+        Reg::V12_PCIE::StateEncoded::try_from(raw)
+            .map_err(|_| FpgaError::InvalidValue)
+    }
+
+    pub fn get_v3p3_pcie_status(
+        &self,
+    ) -> Result<Reg::V3P3_PCIE::StateEncoded, FpgaError> {
+        let raw: u8 = self.fpga_user.read(Addr::V3P3_PCIE)?;
+
+        Reg::V3P3_PCIE::StateEncoded::try_from(raw)
+            .map_err(|_| FpgaError::InvalidValue)
+    }
+
+    pub fn pcie_power_control(&self, enable: bool) -> Result<(), FpgaError> {
+        let op = if enable {
+            WriteOp::BitSet
+        } else {
+            WriteOp::BitClear
+        };
+        self.fpga_user.write(
+            op,
+            Addr::PCIE_POWER_CTRL,
+            Reg::PCIE_POWER_CTRL::V12_PCIE_EN
+                | Reg::PCIE_POWER_CTRL::V3P3_PCIE_EN,
+        )
+    }
 }
 
 impl idl::InOrderSequencerImpl for ServerImpl {
@@ -189,6 +221,90 @@ impl idl::InOrderSequencerImpl for ServerImpl {
         _: &RecvMessage,
     ) -> Result<(), RequestError<MinibarSeqError>> {
         self.sled_power_control(false)
+            .map_err(MinibarSeqError::from)
+            .map_err(RequestError::from)
+    }
+
+    fn pcie_v12_status(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<Reg::V12_PCIE::StateEncoded, RequestError<MinibarSeqError>>
+    {
+        self.get_v12_pcie_status()
+            .map_err(MinibarSeqError::from)
+            .map_err(RequestError::from)
+    }
+
+    fn pcie_v3p3_status(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<Reg::V3P3_PCIE::StateEncoded, RequestError<MinibarSeqError>>
+    {
+        self.get_v3p3_pcie_status()
+            .map_err(MinibarSeqError::from)
+            .map_err(RequestError::from)
+    }
+
+    fn pcie_powered(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<bool, RequestError<MinibarSeqError>> {
+        let v12_state =
+            self.get_v12_pcie_status().map_err(MinibarSeqError::from)?;
+        let v3p3_state =
+            self.get_v3p3_pcie_status().map_err(MinibarSeqError::from)?;
+
+        let v12_good = v12_state == Reg::V12_PCIE::StateEncoded::Enabled;
+        let v3p3_good = v3p3_state == Reg::V3P3_PCIE::StateEncoded::Enabled;
+
+        Ok(v12_good && v3p3_good)
+    }
+
+    fn pcie_power_enable(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<MinibarSeqError>> {
+        self.pcie_power_control(true)
+            .map_err(MinibarSeqError::from)
+            .map_err(RequestError::from)
+    }
+
+    fn pcie_power_disable(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<MinibarSeqError>> {
+        self.pcie_power_control(false)
+            .map_err(MinibarSeqError::from)
+            .map_err(RequestError::from)
+    }
+
+    fn pcie_set_perst_override(
+        &mut self,
+        _: &RecvMessage,
+        assert: bool,
+    ) -> Result<(), idol_runtime::RequestError<MinibarSeqError>> {
+        let mut value = Reg::PCIE_CTRL::FPGA_PERST_OVERRIDE;
+        // PERST is an active low assertion, so deassertion sets the register
+        if !assert {
+            value |= Reg::PCIE_CTRL::FPGA_PERST_CONTROL;
+        }
+        self.fpga_user
+            .write(WriteOp::BitSet, Addr::PCIE_CTRL, value)
+            .map_err(MinibarSeqError::from)
+            .map_err(RequestError::from)
+    }
+
+    fn pcie_clear_perst_override(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), idol_runtime::RequestError<MinibarSeqError>> {
+        self.fpga_user
+            .write(
+                WriteOp::BitClear,
+                Addr::PCIE_CTRL,
+                Reg::PCIE_CTRL::FPGA_PERST_OVERRIDE
+                    | Reg::PCIE_CTRL::FPGA_PERST_CONTROL,
+            )
             .map_err(MinibarSeqError::from)
             .map_err(RequestError::from)
     }
@@ -266,7 +382,7 @@ impl NotificationHandler for ServerImpl {
     }
 }
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     pub const DEVICE_INDEX: u8 = 0;
     pub const EXPECTED_ID: u32 = 0x01de_5bae;

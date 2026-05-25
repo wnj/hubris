@@ -1,12 +1,14 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 #[cfg(feature = "ereport")]
 use anyhow::Context;
 
 fn main() -> Result<()> {
+    build_util::build_notifications()?;
+
     idol::Generator::new()
         .with_counters(
             idol::CounterSettings::default().with_server_counters(false),
@@ -36,6 +38,10 @@ fn main() -> Result<()> {
         Some("psc-a" | "psc-b" | "psc-c") => panic!(concat!(
             "packrat's `gimlet` feature should not be enabled when ",
             "building for PSCs",
+        )),
+        Some("observer-a") => panic!(concat!(
+            "packrat's `gimlet` feature should not be enabled when ",
+            "building for Observers",
         )),
         Some("sidecar-b" | "sidecar-c" | "sidecar-d") => panic!(concat!(
             "packrat's `gimlet` feature should not be enabled when ",

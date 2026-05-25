@@ -14,7 +14,7 @@
 #![no_main]
 
 use ringbuf::{counted_ringbuf, ringbuf_entry};
-use userlib::{hl::sleep_for, task_slot, UnwrapLite};
+use userlib::{UnwrapLite, hl::sleep_for, task_slot};
 
 mod apob; // Details for APOB structs
 mod hf; // Implementation of `HostFlash` API
@@ -35,7 +35,15 @@ enum Trace {
     HashFinalizeError(drv_hash_api::HashError),
 
     ApobFound(apob::ApobLocation),
+    ApobAbl0Mismatch {
+        stored_version: Option<u32>,
+        current_version: Option<u32>,
+    },
     ApobError(apob::ApobError),
+
+    PrevAbl0VersionNotUsed(u32),
+    Abl0VersionFound(u32),
+    Abl0VersionError(apob::ApobError),
 }
 
 counted_ringbuf!(Trace, 32, Trace::None);
@@ -47,7 +55,7 @@ pub const SECTOR_SIZE_BYTES: u32 = drv_hf_api::SECTOR_SIZE_BYTES as u32;
 /// Total flash size is 128 MiB
 pub const FLASH_SIZE_BYTES: u32 = 128 * 1024 * 1024;
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     // Wait for the FPGA to be configured; the sequencer task only starts its
     // Idol loop after the FPGA has been brought up.
@@ -120,6 +128,11 @@ mod instr {
 }
 
 impl FlashDriver {
+    // The SP5 does all of its reads from a particular base address (found
+    // by sniffing the SPI bus), so we have to subtract that out when
+    // calculating the flash offset used by the FPGA
+    const SP5_BASE: u32 = 0x3000000;
+
     fn flash_read_id(&mut self) -> drv_hf_api::HfChipId {
         self.clear_fifos();
         self.drv.data_bytes.set_count(3);
@@ -136,13 +149,11 @@ impl FlashDriver {
         // Make sure die 0 is selected with a dummy read, because the
         // READ_UNIQUE_ID command is die-specific.
         let mut buf = [0u8; 4];
-        self.flash_read(FlashAddr(0), &mut buf.as_mut_slice())
-            .unwrap_lite(); // infallible when given a slice
+        self.flash_read_slice(FlashAddr(0), buf.as_mut_slice());
         let die0_id = self.read_unique_id();
 
         // Then read the top die's unique ID
-        self.flash_read(FlashAddr(0x04000000), &mut buf.as_mut_slice())
-            .unwrap_lite(); // infallible when given a slice
+        self.flash_read_slice(FlashAddr(0x04000000), buf.as_mut_slice());
         let die1_id = self.read_unique_id();
 
         let mut unique_id = [0u8; 17];
@@ -216,7 +227,11 @@ impl FlashDriver {
         // desired status transition occurs in less than 1ms, avoiding a 1-2ms
         // sleep and round-trip through the scheduler. status transitions
         // quickly.
-        const MAX_BUSY_POLLS: u32 = 32;
+        //
+        // Initial tests show that waiting on the FPGA takes ~50 polls when
+        // page programming. Waiting even 1 tick is still more costly than
+        // just waiting for the poll to finish.
+        const MAX_BUSY_POLLS: u32 = 100;
 
         let mut busy_polls = 0;
         while !poll(self) {
@@ -266,6 +281,9 @@ impl FlashDriver {
 
     /// Erases the 64KiB flash sector containing the given address
     fn flash_sector_erase(&mut self, addr: FlashAddr) {
+        if self.flash_is_sector_erased(addr) {
+            return;
+        }
         self.flash_write_enable();
         self.drv.data_bytes.set_count(0);
         self.drv.addr.set_addr(addr.0);
@@ -275,6 +293,37 @@ impl FlashDriver {
 
         // Wait for the busy flag to be unset
         self.wait_flash_busy(Trace::SectorEraseBusy);
+    }
+
+    /// Returns true if the full 64KB sector is erased
+    /// (all bits are set to `1`)
+    fn flash_is_sector_erased(&mut self, addr: FlashAddr) -> bool {
+        let cnt = SECTOR_SIZE_BYTES / (PAGE_SIZE_BYTES as u32);
+        for i in 0..cnt {
+            let addr = addr.0 + i * (PAGE_SIZE_BYTES as u32);
+            self.clear_fifos();
+            self.drv.data_bytes.set_count(PAGE_SIZE_BYTES as u16);
+            self.drv.addr.set_addr(addr);
+            self.drv.dummy_cycles.set_count(8);
+            self.drv.instr.set_opcode(instr::FAST_READ_QUAD_OUTPUT_4B);
+            let mut erased = true;
+            // Technically we could terminate this loop early when
+            // we find the first non-erased byte but we still have
+            // to drain the FIFOs and wait for the FPGA which means
+            // there's no performance gain vs just reading everything
+            // in a loop here.
+            for _ in 0..PAGE_SIZE_BYTES.div_ceil(4) {
+                self.wait_fpga_rx();
+                let v = self.drv.rx_fifo_rdata.fifo_data();
+                if v != u32::MAX {
+                    erased = false;
+                }
+            }
+            if !erased {
+                return false;
+            }
+        }
+        true
     }
 
     /// Reads data from the given address into a `BufWriter`
@@ -310,45 +359,45 @@ impl FlashDriver {
         Ok(())
     }
 
-    /// Writes data from a `BufReader` into the flash
-    ///
-    /// This function will only return an error if it fails to write to a
-    /// provided lease; when given a slice, it is infallible.
-    fn flash_write(
-        &mut self,
-        addr: FlashAddr,
-        data: &mut dyn idol_runtime::BufReader<'_>,
-    ) -> Result<(), ()> {
-        loop {
-            let len = data.remaining_size().min(PAGE_SIZE_BYTES);
-            if len == 0 {
-                break;
-            }
+    /// Read data from flash into a slice
+    fn flash_read_slice(&mut self, offset: FlashAddr, mut dest: &mut [u8]) {
+        // This is infallible, per the docstring on `flash_read`, so we'll
+        // unwrap it here (which lets this function not return an error)
+        self.flash_read(offset, &mut dest).unwrap_lite()
+    }
+
+    /// Writes data from a slice into the flash
+    fn flash_write(&mut self, addr: FlashAddr, data: &[u8]) {
+        // Don't bother writing erased pages
+        if data.iter().all(|x| *x == 0xff) {
+            return;
+        }
+
+        let mut addr = addr.0;
+        for page_chunk in data.chunks(PAGE_SIZE_BYTES) {
             self.flash_write_enable();
-            self.drv.data_bytes.set_count(len as u16);
-            self.drv.addr.set_addr(addr.0);
+            self.drv.data_bytes.set_count(page_chunk.len() as u16);
+            self.drv.addr.set_addr(addr);
             self.drv.dummy_cycles.set_count(0);
-            for i in 0..len.div_ceil(4) {
+
+            for chunk in page_chunk.chunks(4) {
+                // Manually construct the u32 instad of just `try_into`
+                // just in case this slice was an odd number of bytes
                 let mut v = [0u8; 4];
-                for (j, byte) in v.iter_mut().enumerate() {
-                    let k = i * 4 + j;
-                    if k < len {
-                        let Some(d) = data.read() else {
-                            return Err(());
-                        };
-                        *byte = d;
-                    }
+                for (b, v_i) in chunk.iter().zip(v.iter_mut()) {
+                    *v_i = *b;
                 }
                 let v = u32::from_le_bytes(v);
                 self.drv.tx_fifo_wdata.set_fifo_data(v);
             }
+
             self.drv.instr.set_opcode(instr::QUAD_INPUT_PAGE_PROGRAM_4B);
             self.wait_fpga_busy();
 
             // Wait for the busy flag to be unset
             self.wait_flash_busy(Trace::WriteBusy);
+            addr += page_chunk.len() as u32;
         }
-        Ok(())
     }
 
     /// Enable the quad enable bit in flash
@@ -406,17 +455,15 @@ impl FlashDriver {
     }
 
     fn set_espi_addr_offset(&self, v: FlashAddr) {
-        // The SP5 does all of its reads from a particular base address (found
-        // by sniffing the SPI bus), so we have to subtract that out when
-        // calculating the flash offset used by the FPGA
-        const SP5_BASE: u32 = 0x3000000;
         self.drv
             .sp5_flash_offset
-            .set_offset(v.0.wrapping_sub(SP5_BASE));
+            .set_offset(v.0.wrapping_sub(Self::SP5_BASE));
     }
 
     pub(crate) fn set_apob_pos(&self, pos: apob::ApobLocation) {
-        self.drv.apob_flash_addr.set_offset(pos.start);
+        self.drv
+            .apob_flash_addr
+            .set_offset(pos.start.wrapping_add(Self::SP5_BASE));
         self.drv.apob_flash_len.set_offset(pos.size);
     }
 

@@ -1,21 +1,20 @@
 target = "thumbv7em-none-eabihf"
 chip = "../../chips/stm32h7"
-memory = "memory-large.toml"
+default-ram = "axi_sram"
 stacksize = 896
-fwid = true
 
 [kernel]
 name = "cosmo"
 requires = {flash = 32768, ram = 8192}
 features = ["dump", "measurement-handoff"]
-extern-regions = ["dtcm"]
+extern-regions = [{ region = "dtcm", shared = true }]
 
 [mmio]
 peripheral-region = "fmc_nor_psram_bank_1"
 register-map = "../../drv/spartan7-loader/cosmo-seq/cosmo_seq_top.json"
 
 [caboose]
-tasks = ["control_plane_agent"]
+tasks = ["control_plane_agent", "packrat"]
 region = "flash"
 size = 256
 
@@ -24,8 +23,8 @@ name = "task-jefe"
 priority = 0
 max-sizes = {flash = 16384, ram = 4096}
 start = true
-features = ["dump"]
-stacksize = 2304
+features = ["dump", "fault-notification"]
+stacksize = 2424
 notifications = ["fault", "timer"]
 extern-regions = ["sram1", "sram2", "sram3", "sram4"]
 
@@ -33,6 +32,9 @@ extern-regions = ["sram1", "sram2", "sram3", "sram4"]
 net = "jefe-state-change"
 host_sp_comms = "jefe-state-change"
 spd = "jefe-state-change"
+
+[tasks.jefe.config.on-task-fault]
+packrat = "task-faulted"
 
 [tasks.jefe.config.allowed-callers]
 set_state = ["cosmo_seq"]
@@ -44,7 +46,8 @@ name = "task-net"
 stacksize = 8000
 priority = 5
 features = ["mgmt", "h753", "cosmo", "vlan", "vpd-mac"]
-max-sizes = {flash = 131072, ram = 65536, sram1_mac = 16384}
+max-sizes = {flash = 131072, ram = 131072, sram1_mac = 16384}
+default-ram = "dtcm"
 sections = {eth_bulk = "sram1_mac"}
 uses = ["eth", "tim16"]
 start = true
@@ -129,11 +132,11 @@ notifications = ["i2c1-irq", "i2c2-irq", "i2c3-irq", "i2c4-irq"]
 [tasks.packrat]
 name = "task-packrat"
 priority = 1
-stacksize = 1040
+stacksize = 1400
 start = true
-# task-slots is explicitly empty: packrat should not send IPCs!
-task-slots = []
+task-slots = ["jefe"]
 features = ["cosmo", "ereport"]
+notifications = ["task-faulted"]
 
 [tasks.rng_driver]
 features = ["h753", "ereport"]
@@ -149,7 +152,7 @@ name = "task-thermal"
 features = ["cosmo"]
 priority = 8
 max-sizes = {flash = 32768, ram = 8192 }
-stacksize = 6000
+stacksize = 3000
 start = true
 task-slots = ["i2c_driver", "sensor", "cosmo_seq", "jefe"]
 notifications = ["timer"]
@@ -168,20 +171,21 @@ notifications = ["timer"]
 name = "task-hiffy"
 features = ["h753", "stm32h7", "i2c", "gpio", "spi", "qspi", "hash", "sprot", "turbo"]
 priority = 7
-max-sizes = {flash = 32768, ram = 32768 }
+max-sizes = {flash = 32768, ram = 65536 }
 stacksize = 1200
 start = true
-task-slots = ["sys", "hf", "i2c_driver", "hash_driver", "update_server", "sprot"]
+task-slots = ["sys", "hf", "i2c_driver", "hash_driver", "update_server", "sprot", "net"]
+notifications = ["timer"]
 
 [tasks.cosmo_seq]
 name = "drv-cosmo-seq-server"
 features = ["h753"]
 priority = 7
-max-sizes = {flash = 131072, ram = 16384 }
-stacksize = 2600
+max-sizes = {flash = 131072, ram = 32768 }
+stacksize = 3200
 start = true
 task-slots = ["sys", "i2c_driver", {spi_front = "spi3_driver"}, "jefe", "packrat", "auxflash", "spartan7_loader", "hf"]
-uses = ["mmio_sequencer", "mmio_info", "mmio_espi"]
+uses = ["mmio_sequencer", "mmio_info", "mmio_espi", "mmio_debug_ctrl"]
 notifications = ["timer", "vcore", "seq-irq"]
 
 [tasks.ignition_flash]
@@ -200,16 +204,14 @@ max-sizes = {flash = 131072, ram = 16384 }
 stacksize = 2600
 start = true
 task-slots = ["sys", {spi = "spi2_driver"}, "auxflash"]
+copy-to-archive = ["register_defs"]
 
 [tasks.spartan7_loader.config]
 program_l = "sys_api::Port::B.pin(1)"
 init_l = "sys_api::Port::B.pin(6)"
 config_done = "sys_api::Port::B.pin(4)"
 user_reset_l = "sys_api::Port::A.pin(6)"
-
-[tasks.cosmo_seq.config]
-fpga_image = "cosmo-a.bin"
-register_defs = "cosmo-regs-a.json"
+register_defs = "cosmo-seq/*.json"
 
 [tasks.hash_driver]
 name = "drv-stm32h7-hash-server"
@@ -256,7 +258,7 @@ features = ["stm32h753", "usart6", "baud_rate_3M", "hardware_flow_control", "vla
 uses = ["usart6", "dbgmcu"]
 interrupts = {"usart6.irq" = "usart-irq"}
 priority = 9
-max-sizes = {flash = 69120, ram = 65536}
+max-sizes = {flash = 70000, ram = 65536}
 stacksize = 5400
 start = true
 task-slots = ["sys", { cpu_seq = "cosmo_seq" }, "hf", "control_plane_agent", "net", "packrat", "i2c_driver", { spi_driver = "spi2_driver" }, "sprot", "auxflash"]
@@ -404,28 +406,6 @@ stacksize = 256
 start = true
 
 [config]
-
-#
-# I2C1: Front FPGA I2C mux
-#
-[[config.i2c.controllers]]
-controller = 1
-
-#
-# SMBUS_SP_TO_FPGA2_SMCLK
-# SMBUS_SP_TO_FPGA2_SMDAT
-#
-[config.i2c.controllers.ports.B]
-name = "front"
-description = "Front FPGA mux"
-scl.pin = 8
-sda.pin = 9
-af = 4
-
-# The front FPGA has one sixteen-channel virtual mux
-[[config.i2c.controllers.ports.B.muxes]]
-driver = "oximux16"
-address = 0x70
 
 #
 # I2C2: Main FPGA I2C mux
@@ -1170,7 +1150,7 @@ device = "bmr491"
 name = "IBC"
 description = "Intermediate bus converter"
 power = { rails = [ "V12_SYS_A2" ] }
-sensors = { temperature = 1, power = 1, voltage = 1, current = 1 }
+sensors = { temperature = 1, voltage = 1, current = 1 }
 refdes = "U80"
 
 [[config.i2c.devices]]
@@ -1373,6 +1353,12 @@ name = "L_TS1"
 device = "dimm"
 description = "DIMM L, sensor 1"
 sensors.temperature = 1
+
+[[config.sensor.devices]]
+name = "fan_ctrl"
+device = "thermal_loop"
+description = "Thermal loop"
+sensors.pwm = 1
 
 ################################################################################
 [config.spi.spi2]

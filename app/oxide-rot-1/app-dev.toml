@@ -10,7 +10,6 @@ stacksize = 1024
 image-names = ["a", "b"]
 epoch = 0
 version = 0
-fwid = true
 
 [kernel]
 name = "oxide-rot-1"
@@ -41,6 +40,7 @@ max-sizes = {flash = 32768, ram = 16384 }
 stacksize = 2048
 start = true
 task-slots = ["gpio_driver", "swd", "update_server"]
+notifications = ["timer"]
 
 [tasks.idle]
 name = "task-idle"

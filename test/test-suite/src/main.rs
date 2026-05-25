@@ -27,9 +27,9 @@ use hubris_num_tasks::NUM_TASKS;
 use ringbuf::{ringbuf, ringbuf_entry};
 use test_api::{AssistOp, RunnerOp, SuiteOp};
 use userlib::{
-    hl, kipc, task_slot, FaultInfo, FaultSource, Generation, IrqStatus,
-    LeaseAttributes, ReplyFaultReason, SchedState, TaskId, TaskState,
-    UsageError,
+    FaultInfo, FaultSource, Generation, IrqStatus, LeaseAttributes,
+    ReplyFaultReason, SchedState, TaskId, TaskState, UsageError, hl, kipc,
+    task_slot,
 };
 use zerocopy::IntoBytes;
 
@@ -53,7 +53,7 @@ const BAD_ADDRESS: u32 = 0x0;
 /// is to ensure that this actually gets emitted as a symbol.
 macro_rules! test_cases {
     ($($(#[$attr:meta])* $name:path,)*) => {
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         #[used(linker)]
         static TESTS: &[(&str, &(dyn Fn() + Send + Sync))] = &[
             $(
@@ -134,6 +134,7 @@ test_cases! {
     test_irq_status,
     #[cfg(feature = "fru-id-eeprom")]
     at24csw080::test_at24csw080,
+    test_read_panic_message,
 }
 
 /// Tests that we can send a message to our assistant, and that the assistant
@@ -612,7 +613,7 @@ task_slot!(I2C, i2c_driver);
 // a single cfg block
 #[cfg(feature = "fru-id-eeprom")]
 mod at24csw080 {
-    use super::{i2c_config, I2C};
+    use super::{I2C, i2c_config};
     use drv_i2c_devices::at24csw080::{At24Csw080, Error, WriteProtectBlock};
 
     const EEPROM_SIZE: u16 = 1024;
@@ -1275,10 +1276,12 @@ fn test_timer_notify_past() {
 #[cfg(any(armv7m, armv8m))]
 fn test_floating_point(highregs: bool) {
     unsafe fn read_regs(dest: &mut [u32; 16], highregs: bool) {
-        if !highregs {
-            core::arch::asm!("vstm {0}, {{s0-s15}}", in(reg) dest);
-        } else {
-            core::arch::asm!("vstm {0}, {{s16-s31}}", in(reg) dest);
+        unsafe {
+            if !highregs {
+                core::arch::asm!("vstm {0}, {{s0-s15}}", in(reg) dest);
+            } else {
+                core::arch::asm!("vstm {0}, {{s16-s31}}", in(reg) dest);
+            }
         }
     }
 
@@ -1553,6 +1556,40 @@ fn test_irq_status() {
     assert_eq!(status, expected_status);
 }
 
+/// Tests that when a task panics, its panic message can be read via the `read_panic_message` kipc.
+fn test_read_panic_message() {
+    set_autorestart(false);
+
+    let mut buf = [0u8; userlib::PANIC_MESSAGE_MAX_LEN];
+
+    match kipc::read_panic_message(ASSIST.get_task_index().into(), &mut buf) {
+        Err(userlib::ReadPanicMessageError::TaskNotPanicked) => {}
+        x => panic!("expected `Err(TaskNotPanicked)`, got: {x:?}"),
+    }
+
+    // Ask the assistant to panic.
+    let assist = assist_task_id();
+    let mut response = 0u32;
+    let (_, _) = userlib::sys_send(
+        assist,
+        AssistOp::Panic as u16,
+        &0u32.to_le_bytes(),
+        response.as_mut_bytes(),
+        &[],
+    );
+
+    let mut msg_chunks =
+        kipc::read_panic_message(ASSIST.get_task_index().into(), &mut buf)
+            .unwrap();
+    // it should look kinda like a panic message (but since the line number may
+    // change, don't make assertions about the entire contents of the string...
+    let msg = msg_chunks
+        .next()
+        .expect("Utf8Chunks always has at least one chunk")
+        .valid();
+    assert!(msg.starts_with("panicked at"));
+}
+
 /// Asks the test runner (running as supervisor) to please trigger a software
 /// interrupt for `notifications::TEST_IRQ`, thank you.
 #[track_caller]
@@ -1612,7 +1649,7 @@ fn read_runner_notifications() -> u32 {
 }
 
 /// Actual entry point.
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     // Work out the assistant generation. Restart it to ensure it's running
     // before we try talking to it. TODO: this is kind of gross, we need a way

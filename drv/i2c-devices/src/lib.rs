@@ -44,21 +44,19 @@ use pmbus::commands::CommandCode;
 
 macro_rules! pmbus_read {
     ($device:expr, $cmd:ident) => {
-        match $cmd::CommandData::from_slice(&match $device
+        $device
             .read_reg::<u8, [u8; $cmd::CommandData::len()]>(
                 $cmd::CommandData::code(),
-            ) {
-            Ok(rval) => Ok(rval),
-            Err(code) => Err(Error::BadRead {
+            )
+            .map_err(|code| Error::BadRead {
                 cmd: $cmd::CommandData::code(),
                 code,
-            }),
-        }?) {
-            Some(data) => Ok(data),
-            None => Err(Error::BadData {
-                cmd: $cmd::CommandData::code(),
-            }),
-        }
+            })
+            .and_then(|rval| {
+                $cmd::CommandData::from_slice(&rval).ok_or(Error::BadData {
+                    cmd: $cmd::CommandData::code(),
+                })
+            })
     };
 
     ($device:expr, $dev:ident::$cmd:ident) => {{
@@ -68,56 +66,47 @@ macro_rules! pmbus_read {
 }
 
 macro_rules! pmbus_rail_read {
-    ($device:expr, $rail:expr, $cmd:ident) => {{
-        let payload = [PAGE::CommandData::code(), $rail];
-
-        match $cmd::CommandData::from_slice(&match $device
+    ($device:expr, $rail:expr, $cmd:ident) => {
+        $device
             .write_read_reg::<u8, [u8; $cmd::CommandData::len()]>(
                 $cmd::CommandData::code(),
-                &payload,
-            ) {
-            Ok(rval) => Ok(rval),
-            Err(code) => Err(Error::BadRead {
+                &[PAGE::CommandData::code(), $rail],
+            )
+            .map_err(|code| Error::BadRead {
                 cmd: $cmd::CommandData::code(),
                 code,
-            }),
-        }?) {
-            Some(data) => Ok(data),
-            None => Err(Error::BadData {
-                cmd: $cmd::CommandData::code(),
-            }),
-        }
-    }};
+            })
+            .and_then(|rval| {
+                $cmd::CommandData::from_slice(&rval).ok_or(Error::BadData {
+                    cmd: $cmd::CommandData::code(),
+                })
+            })
+    };
 
     ($device:expr, $rail:expr, $dev:ident::$cmd:ident) => {{
-        use $dev::{$cmd, PAGE};
+        use $dev::{PAGE, $cmd};
         pmbus_rail_read!($device, $rail, $cmd)
     }};
 }
 
 macro_rules! pmbus_rail_phase_read {
-    ($device:expr, $rail:expr, $phase:expr, $cmd:ident) => {{
-        let rail_payload = [PAGE::CommandData::code(), $rail];
-        let phase_payload = [PHASE::CommandData::code(), $phase];
-
-        match $cmd::CommandData::from_slice(&match $device
+    ($device:expr, $rail:expr, $phase:expr, $cmd:ident) => {
+        $device
             .write_write_read_reg::<u8, [u8; $cmd::CommandData::len()]>(
                 $cmd::CommandData::code(),
-                &rail_payload,
-                &phase_payload,
-            ) {
-            Ok(rval) => Ok(rval),
-            Err(code) => Err(Error::BadRead {
+                &[PAGE::CommandData::code(), $rail],
+                &[PHASE::CommandData::code(), $phase],
+            )
+            .map_err(|code| Error::BadRead {
                 cmd: $cmd::CommandData::code(),
                 code,
-            }),
-        }?) {
-            Some(data) => Ok(data),
-            None => Err(Error::BadData {
-                cmd: $cmd::CommandData::code(),
-            }),
-        }
-    }};
+            })
+            .and_then(|rval| {
+                $cmd::CommandData::from_slice(&rval).ok_or(Error::BadData {
+                    cmd: $cmd::CommandData::code(),
+                })
+            })
+    };
 }
 
 macro_rules! pmbus_write {
@@ -154,6 +143,19 @@ macro_rules! pmbus_write {
 }
 
 macro_rules! pmbus_rail_write {
+    // Write a command with no additional data bytes.
+    ($device:expr, $rail:expr, $cmd:ident) => {{
+        let rpayload = [PAGE::CommandData::code(), $rail];
+        let payload: [u8; 1] = [CommandCode::$cmd as u8];
+        match $device.write_write(&rpayload, &payload) {
+            Err(code) => Err(Error::BadWrite {
+                cmd: CommandCode::$cmd as u8,
+                code,
+            }),
+            Ok(_) => Ok(()),
+        }
+    }};
+    // Write a command code followed by data.
     ($device:expr, $rail:expr, $cmd:ident, $data:expr) => {{
         let rpayload = [PAGE::CommandData::code(), $rail];
 
@@ -171,8 +173,44 @@ macro_rules! pmbus_rail_write {
     }};
 
     ($device:expr, $rail:expr, $dev:ident::$cmd:ident, $data:expr) => {{
-        use $dev::{$cmd, PAGE};
+        use $dev::{PAGE, $cmd};
         pmbus_rail_write!($device, $rail, $cmd, $data)
+    }};
+}
+
+/// Write the mask `$mask` to the `SMBALERT_MASK` register for `$reg`, where
+/// `$reg` is a status register, and `$mask` is a `CommandData` value for that
+/// register.
+///
+/// Importantly, `$reg` must be a PMBus `STATUS_<whatever>` register. This macro
+/// cannot stop you from providing any `CommandCode` as the value of `$reg` and
+/// any `CommandData` as the value of `$mask`, but, uh, don't do that. On the
+/// other hand, the macro *does* at least ensure that `$mask` is a `CommandData`.
+/// for the same register as `$reg`.
+macro_rules! pmbus_smbalert_mask_write {
+    ($device:expr, $rail:expr, $reg:ident, $mask:expr) => {{
+        // This assignment is just a type assertion that `$mask` is a
+        // `CommandData` for the same register as `$reg`.
+        let mask: $reg::CommandData = $mask;
+        let rpayload = [PAGE::CommandData::code(), $rail];
+        // N.B. that the status register *should* always be a single byte, but
+        // we'll do this "properly" just in case.
+        let mut payload = [0u8; $reg::CommandData::len() + 2];
+        // 0               7               15              23
+        // +---------------+---------------+---------------+
+        // | SMBALERT_MASK | register code | mask byte     |
+        // +---------------+---------------+---------------+
+        payload[0] = CommandCode::SMBALERT_MASK as u8;
+        payload[1] = $reg::CommandData::code();
+        mask.to_slice(&mut payload[2..]);
+
+        match $device.write_write(&rpayload, &payload) {
+            Err(code) => Err(Error::BadWrite {
+                cmd: CommandCode::SMBALERT_MASK as u8,
+                code,
+            }),
+            Ok(_) => Ok(()),
+        }
     }};
 }
 

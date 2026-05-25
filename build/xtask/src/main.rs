@@ -2,28 +2,24 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// siiiiigh this was supposed to be on globally, but missed
-// applying to xtask itself -- so we have a lot of elided
-// lifetimes. TODO turn this back on!
-#![allow(elided_lifetimes_in_paths)]
-
 use std::path::PathBuf;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
 use crate::config::Config;
 
 mod auxflash;
 mod caboose_pos;
-mod clippy;
 mod config;
 mod dist;
 mod elf;
 mod flash;
+mod gha_prepare_artifacts;
 mod graph;
 mod humility;
 mod lsp;
+mod passthrough;
 mod print;
 mod sizes;
 mod task_slot;
@@ -42,6 +38,9 @@ enum Xtask {
         /// `cargo rustc ...`
         #[clap(short, long)]
         edges: bool,
+        /// Skip the check for home directory paths in the final binaries
+        #[clap(long = "dangerously-skip-path-check")]
+        skip_path_check: bool,
         /// Path to the image configuration file, in TOML.
         cfg: PathBuf,
         /// Allow operation in a dirty checkout, i.e. don't clean before
@@ -86,6 +85,9 @@ enum Xtask {
         /// rebuilding even if it looks like we need to.
         #[clap(long)]
         dirty: bool,
+        /// Skip the check for home directory paths in the final binaries
+        #[clap(long = "dangerously-skip-path-check")]
+        skip_path_check: bool,
         /// Configures the caboose for the generated archive.
         #[clap(flatten)]
         caboose_args: CabooseArgs,
@@ -125,6 +127,10 @@ enum Xtask {
         #[clap(long)]
         dirty: bool,
 
+        /// Print per-task stack depth
+        #[clap(long)]
+        stacks: bool,
+
         /// Configures the caboose for the generated archive.
         #[clap(flatten)]
         caboose_args: CabooseArgs,
@@ -148,6 +154,24 @@ enum Xtask {
         /// Configures the caboose for the generated archive.
         #[clap(flatten)]
         caboose_args: CabooseArgs,
+    },
+
+    /// Runs `cargo doc` on a specified task
+    Doc {
+        /// Request verbosity from tools we shell out to.
+        #[clap(short)]
+        verbose: bool,
+
+        /// Path to the image configuration file, in TOML.
+        cfg: PathBuf,
+
+        /// Name of task(s) to check.
+        tasks: Vec<String>,
+
+        /// Arguments passed directly to the `cargo doc` invocation,
+        /// e.g. `--open`
+        #[clap(last = true)]
+        doc_args: Vec<String>,
     },
 
     /// Runs `cargo clippy` on a specified task
@@ -222,6 +246,14 @@ enum Xtask {
         /// Path to a Rust source file
         file: PathBuf,
     },
+
+    /// Prepare artifacts for upload in CI.
+    GhaPrepareArtifacts {
+        /// Path to the image configuration file, in TOML.
+        cfg: PathBuf,
+        /// Path to the JSONL file containing all of the attestations to upload, if generated.
+        attestation: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -282,11 +314,28 @@ fn run(xtask: Xtask) -> Result<()> {
             cfg,
             dirty,
             caboose_args,
+            skip_path_check,
         } => {
-            let allocs =
-                dist::package(verbose, edges, &cfg, None, dirty, caboose_args)?;
+            let allocs = dist::package(
+                &cfg,
+                dist::PackageFlags {
+                    verbose,
+                    edges,
+                    dirty_ok: dirty,
+                    skip_path_check,
+                },
+                None,
+                caboose_args,
+            )?;
             for (_, (a, _)) in allocs {
-                sizes::run(&cfg, &a, true, false, false, false)?;
+                let flags = sizes::SizeFlags {
+                    only_suggest: true,
+                    compare: false,
+                    save: false,
+                    stacks: false,
+                    verbose: false,
+                };
+                sizes::run(&cfg, &a, flags)?;
             }
         }
         Xtask::Build {
@@ -301,11 +350,14 @@ fn run(xtask: Xtask) -> Result<()> {
                 dist::list_tasks(&cfg)?;
             } else {
                 dist::package(
-                    verbose,
-                    edges,
                     &cfg,
+                    dist::PackageFlags {
+                        verbose,
+                        edges,
+                        dirty_ok: dirty,
+                        skip_path_check: true,
+                    },
                     Some(tasks),
-                    dirty,
                     CabooseArgs::default(),
                 )?;
             }
@@ -313,14 +365,18 @@ fn run(xtask: Xtask) -> Result<()> {
         Xtask::Flash {
             dirty,
             mut args,
+            skip_path_check,
             caboose_args,
         } => {
             dist::package(
-                args.verbose,
-                false,
                 &args.cfg,
+                dist::PackageFlags {
+                    verbose: args.verbose,
+                    edges: false,
+                    dirty_ok: dirty,
+                    skip_path_check,
+                },
                 None,
-                dirty,
                 caboose_args,
             )?;
             let toml = Config::from_file(&args.cfg)?;
@@ -337,7 +393,7 @@ fn run(xtask: Xtask) -> Result<()> {
 
             let image_name = if let Some(ref name) = args.image_name {
                 if !toml.check_image_name(name) {
-                    bail!("Image name {} not declared in TOML", name);
+                    bail!("Image name {name} not declared in TOML");
                 }
                 name
             } else {
@@ -352,25 +408,36 @@ fn run(xtask: Xtask) -> Result<()> {
             compare,
             save,
             dirty,
+            stacks,
             caboose_args,
         } => {
             let allocs = dist::package(
-                verbose >= 2,
-                false,
                 &cfg,
+                dist::PackageFlags {
+                    verbose: verbose >= 2,
+                    edges: false,
+                    dirty_ok: dirty,
+                    skip_path_check: false,
+                },
                 None,
-                dirty,
                 caboose_args,
             )?;
+            let flags = sizes::SizeFlags {
+                only_suggest: false,
+                compare,
+                save,
+                stacks,
+                verbose: verbose >= 1,
+            };
             for (_, (a, _)) in allocs {
-                sizes::run(&cfg, &a, false, compare, save, verbose >= 1)?;
+                sizes::run(&cfg, &a, flags)?;
             }
         }
         Xtask::Humility { args } => {
             let toml = Config::from_file(&args.cfg)?;
             let image_name = if let Some(ref name) = args.image_name {
                 if !toml.check_image_name(name) {
-                    bail!("Image name {} not declared in TOML", name);
+                    bail!("Image name {name} not declared in TOML");
                 }
                 name
             } else {
@@ -386,7 +453,7 @@ fn run(xtask: Xtask) -> Result<()> {
             let toml = Config::from_file(&args.cfg)?;
             let image_name = if let Some(ref name) = args.image_name {
                 if !toml.check_image_name(name) {
-                    bail!("Image name {} not declared in TOML", name);
+                    bail!("Image name {name} not declared in TOML");
                 }
                 name
             } else {
@@ -394,11 +461,14 @@ fn run(xtask: Xtask) -> Result<()> {
             };
             if !noflash {
                 dist::package(
-                    args.verbose,
-                    false,
                     &args.cfg,
+                    dist::PackageFlags {
+                        verbose: args.verbose,
+                        edges: false,
+                        dirty_ok: false,
+                        skip_path_check: false,
+                    },
                     None,
-                    false,
                     caboose_args,
                 )?;
                 // Delegate flashing to `humility gdb`, which also modifies
@@ -415,7 +485,7 @@ fn run(xtask: Xtask) -> Result<()> {
             let toml = Config::from_file(&args.cfg)?;
             let image_name = if let Some(ref name) = args.image_name {
                 if !toml.check_image_name(name) {
-                    bail!("Image name {} not declared in TOML", name);
+                    bail!("Image name {name} not declared in TOML");
                 }
                 name
             } else {
@@ -426,6 +496,7 @@ fn run(xtask: Xtask) -> Result<()> {
                     args: args.clone(),
                     dirty: false,
                     caboose_args,
+                    skip_path_check: false,
                 })?;
             }
             humility::run(&args, &[], Some("test"), false, image_name)?;
@@ -436,7 +507,26 @@ fn run(xtask: Xtask) -> Result<()> {
             tasks,
             extra_options,
         } => {
-            clippy::run(verbose, cfg, &tasks, &extra_options)?;
+            // Clippy commands are passed AFTER the `--`, currently pre-options
+            // are not supported.
+            passthrough::run(
+                "clippy",
+                verbose,
+                cfg,
+                &tasks,
+                &[],
+                &extra_options,
+            )?;
+        }
+        Xtask::Doc {
+            verbose,
+            cfg,
+            tasks,
+            doc_args,
+        } => {
+            // Doc commands are passed BEFORE the `--`, currently post-options
+            // are not supported.
+            passthrough::run("doc", verbose, cfg, &tasks, &doc_args, &[])?;
         }
         Xtask::TaskSlots { task_bin } => {
             task_slot::dump_task_slot_table(&task_bin)?;
@@ -455,6 +545,9 @@ fn run(xtask: Xtask) -> Result<()> {
         }
         Xtask::Lsp { clients, file } => {
             lsp::run(&file, &clients)?;
+        }
+        Xtask::GhaPrepareArtifacts { cfg, attestation } => {
+            gha_prepare_artifacts::run(&cfg, attestation.as_deref())?;
         }
     }
 

@@ -101,13 +101,14 @@
 
 use drv_i2c_api::I2cDevice;
 use drv_i2c_devices::mwocp68::{self, Mwocp68};
-use drv_packrat_vpd_loader::{read_vpd_and_load_packrat, Packrat};
+use drv_packrat_vpd_loader::{Packrat, read_vpd_and_load_packrat};
 use drv_psc_seq_api::PowerState;
 use drv_stm32xx_sys_api as sys_api;
 use sys_api::{Edge, IrqControl, OutputType, PinSet, Pull, Speed};
 use task_jefe_api::Jefe;
 use userlib::*;
 
+use fixedstr::{FixedStr, FixedString};
 use ringbuf::{counted_ringbuf, ringbuf_entry};
 
 task_slot!(SYS, sys);
@@ -126,7 +127,7 @@ enum Event {
         now: u64,
         #[count(children)]
         psu: Slot,
-        serial: Option<[u8; 12]>,
+        serial: Option<FixedString<12>>,
     },
     /// Emitted at task startup when we find that a power supply appears to have
     /// been disabled.
@@ -134,14 +135,14 @@ enum Event {
         now: u64,
         #[count(children)]
         psu: Slot,
-        serial: Option<[u8; 12]>,
+        serial: Option<FixedString<12>>,
     },
     /// Emitted when a previously not present PSU's presence pin is asserted.
     Inserted {
         now: u64,
         #[count(children)]
         psu: Slot,
-        serial: Option<[u8; 12]>,
+        serial: Option<FixedString<12>>,
     },
     /// Emitted when a previously present PSU's presence pin is deasserted.
     Removed {
@@ -250,27 +251,6 @@ enum Trace {
         psu: Slot,
         err: mwocp68::Error,
     },
-    EreportSent {
-        now: u64,
-        #[count(children)]
-        psu: Slot,
-        class: ereport::Class,
-        len: usize,
-    },
-    EreportLost {
-        now: u64,
-        #[count(children)]
-        psu: Slot,
-        class: ereport::Class,
-        len: usize,
-        err: task_packrat_api::EreportWriteError,
-    },
-    EreportTooBig {
-        now: u64,
-        #[count(children)]
-        psu: Slot,
-        class: ereport::Class,
-    },
 }
 
 // Since entries in this ringbuffer contain timestamps, they will never be
@@ -281,7 +261,7 @@ counted_ringbuf!(__TRACE, Trace, 32, Trace::None, no_dedup);
 /// `counted_ringbuf!`, instead of representing PSU numbers as raw u8s, which
 /// cannot derive `counters::Count` (and would have to generate a counter table
 /// with 256 entries rather than just 6).
-#[derive(Copy, Clone, Eq, PartialEq, counters::Count, serde::Serialize)]
+#[derive(Copy, Clone, Eq, PartialEq, counters::Count)]
 #[repr(u8)]
 enum Slot {
     Psu0 = 0,
@@ -450,7 +430,7 @@ enum PresentState {
     OnProbation { deadline: u64 },
 }
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     let sys = sys_api::Sys::from(SYS.get_task_id());
 
@@ -477,14 +457,7 @@ fn main() -> ! {
     let packrat = Packrat::from(PACKRAT.get_task_id());
     read_vpd_and_load_packrat(&packrat, I2C.get_task_id());
 
-    // Statically allocate a buffer for ereport CBOR encoding, so that it's not
-    // on the stack.
-    let ereport_buf = {
-        use static_cell::ClaimOnceCell;
-
-        static BUF: ClaimOnceCell<[u8; 256]> = ClaimOnceCell::new([0; 256]);
-        BUF.claim()
-    };
+    let mut ereporter = Ereporter::claim_static_resources(packrat);
 
     let jefe = Jefe::from(JEFE.get_task_id());
     jefe.set_state(PowerState::A2 as u32);
@@ -643,8 +616,7 @@ fn main() -> ! {
             } else {
                 Status::NotGood
             };
-            let step = psus[i].step(now, present, ok);
-            match step.action {
+            match psus[i].step(now, present, ok, &mut ereporter) {
                 None => (),
 
                 Some(ActionRequired::EnableMe) => {
@@ -676,43 +648,6 @@ fn main() -> ! {
                         Speed::Low,
                         Pull::None,
                     );
-                }
-            }
-            if let Some(ereport) = step.ereport {
-                match packrat.serialize_ereport(&ereport, &mut ereport_buf[..])
-                {
-                    Ok(len) => ringbuf_entry!(
-                        __TRACE,
-                        Trace::EreportSent {
-                            now,
-                            psu: ereport.slot,
-                            len,
-                            class: ereport.class,
-                        }
-                    ),
-                    Err(task_packrat_api::EreportSerializeError::Packrat {
-                        err,
-                        len,
-                    }) => ringbuf_entry!(
-                        __TRACE,
-                        Trace::EreportLost {
-                            now,
-                            psu: ereport.slot,
-                            len,
-                            class: ereport.class,
-                            err,
-                        }
-                    ),
-                    Err(
-                        task_packrat_api::EreportSerializeError::Serialize(_),
-                    ) => ringbuf_entry!(
-                        __TRACE,
-                        Trace::EreportTooBig {
-                            now,
-                            psu: ereport.slot,
-                            class: ereport.class,
-                        }
-                    ),
                 }
             }
         }
@@ -764,11 +699,17 @@ impl Psu {
     /// This may be called at unpredictable intervals, and may be called more
     /// than once for the same timestamp value. The implementation **must** use
     /// `now` and the timer to control any time-sensitive operations.
-    fn step(&mut self, now: u64, present: Present, pwr_ok: Status) -> Step {
+    fn step(
+        &mut self,
+        now: u64,
+        present: Present,
+        pwr_ok: Status,
+        ereporter: &mut Ereporter,
+    ) -> Option<ActionRequired> {
         match (self.state, present, pwr_ok) {
             (PsuState::NotPresent, Present::No, _) => {
                 // ignore the power good line, it is meaningless.
-                Step::default()
+                None
             }
 
             // Regardless of our current state, if we observe the present line
@@ -782,26 +723,17 @@ impl Psu {
                     now,
                     psu: self.slot
                 });
-                let ereport = ereport::Ereport {
-                    class: ereport::Class::Removed,
-                    version: 0,
-                    refdes: self.dev.i2c_device().component_id(),
-                    slot: self.slot,
-                    rail: self.slot,
-                    fruid: self.fruid,
-                    pmbus_status: None,
-                };
+                let _ = ereporter.deliver_ereport(&PsuRemovedEreport {
+                    fields: self.ereport_fields(),
+                });
 
                 self.state = PsuState::NotPresent;
                 // Clear the FRUID serial only *after* we have put it in the ereport.
                 self.fruid = PsuFruid::default();
 
-                Step {
-                    action: Some(ActionRequired::DisableMe {
-                        attempt_snapshot: false,
-                    }),
-                    ereport: Some(ereport),
-                }
+                Some(ActionRequired::DisableMe {
+                    attempt_snapshot: false,
+                })
             }
 
             // In a not-present situation we have to ignore the OK line entirely
@@ -821,7 +753,7 @@ impl Psu {
                     serial: self.fruid.serial
                 });
                 // No external action required until our timer elapses.
-                Step::default()
+                None
             }
 
             (
@@ -840,23 +772,14 @@ impl Psu {
                     self.state = PsuState::Present(PresentState::On {
                         was_faulted: false,
                     });
-                    let ereport = ereport::Ereport {
-                        class: ereport::Class::Inserted,
-                        version: 0,
-                        refdes: self.dev.i2c_device().component_id(),
-                        slot: self.slot,
-                        rail: self.slot,
-                        fruid: self.fruid,
-                        pmbus_status: None,
-                    };
+                    let _ = ereporter.deliver_ereport(&PsuInsertedEreport {
+                        fields: self.ereport_fields(),
+                    });
 
-                    Step {
-                        action: Some(ActionRequired::EnableMe),
-                        ereport: Some(ereport),
-                    }
+                    Some(ActionRequired::EnableMe)
                 } else {
                     // Remain in this state.
-                    Step::default()
+                    None
                 }
             }
 
@@ -872,7 +795,7 @@ impl Psu {
 
                 // If we just turned this PSU back on after a fault, reasserting
                 // POWER_GOOD means that the fault has cleared.
-                let ereport = if was_faulted {
+                if was_faulted {
                     // Clear our tracking of the fault. If we fault again, treat
                     // that as a new fault.
                     self.state = PsuState::Present(PresentState::On {
@@ -886,23 +809,13 @@ impl Psu {
                         }
                     );
                     // Report that the fault has gone away.
-                    Some(ereport::Ereport {
-                        class: ereport::Class::PowerGood,
-                        version: 0,
-                        refdes: self.dev.i2c_device().component_id(),
-                        slot: self.slot,
-                        rail: self.slot,
-                        fruid: self.fruid,
-                        pmbus_status: Some(self.read_pmbus_status(now)),
-                    })
-                } else {
-                    // If we did not just restart after a fault, do nothing.
-                    None
-                };
-                Step {
-                    action: None,
-                    ereport,
+                    let _ = ereporter.deliver_ereport(&PowerGoodEreport {
+                        pmbus_status: self.read_pmbus_status(now),
+                        fields: self.ereport_fields(),
+                    });
                 }
+
+                None
             }
             (
                 PsuState::Present(PresentState::On { was_faulted }),
@@ -918,7 +831,7 @@ impl Psu {
                 });
                 // Did we just restart after a fault? If not, this is a new
                 // fault, which should be reported.
-                let ereport = if !was_faulted {
+                if !was_faulted {
                     ringbuf_entry!(
                         __TRACE,
                         Trace::PowerGoodDeasserted {
@@ -926,15 +839,10 @@ impl Psu {
                             psu: self.slot,
                         }
                     );
-                    Some(ereport::Ereport {
-                        class: ereport::Class::PowerUngood,
-                        version: 0,
-                        refdes: self.dev.i2c_device().component_id(),
-                        rail: self.slot,
-                        slot: self.slot,
-                        fruid: self.fruid,
-                        pmbus_status: Some(self.read_pmbus_status(now)),
-                    })
+                    let _ = ereporter.deliver_ereport(&PowerUngoodEreport {
+                        fields: self.ereport_fields(),
+                        pmbus_status: self.read_pmbus_status(now),
+                    });
                 } else {
                     ringbuf_entry!(
                         __TRACE,
@@ -943,15 +851,11 @@ impl Psu {
                             psu: self.slot,
                         }
                     );
-                    None
                 };
 
-                Step {
-                    action: Some(ActionRequired::DisableMe {
-                        attempt_snapshot: true,
-                    }),
-                    ereport,
-                }
+                Some(ActionRequired::DisableMe {
+                    attempt_snapshot: true,
+                })
             }
 
             (
@@ -966,13 +870,9 @@ impl Psu {
                     self.state = PsuState::Present(PresentState::OnProbation {
                         deadline: now.saturating_add(PROBATION_MS),
                     });
-                    Step {
-                        action: Some(ActionRequired::EnableMe),
-                        ereport: None,
-                    }
+                    Some(ActionRequired::EnableMe)
                 } else {
-                    // Remain in this state.
-                    Step::default()
+                    None
                 }
             }
             (
@@ -989,10 +889,10 @@ impl Psu {
                     self.state = PsuState::Present(PresentState::On {
                         was_faulted: true,
                     });
-                    Step::default()
+                    None
                 } else {
                     // Remain in this state.
-                    Step::default()
+                    None
                 }
             }
         }
@@ -1002,7 +902,7 @@ impl Psu {
         self.fruid.refresh(&self.dev, self.slot, now);
     }
 
-    fn read_pmbus_status(&mut self, now: u64) -> ereport::PmbusStatus {
+    fn read_pmbus_status(&mut self, now: u64) -> ereports::pwr::PmbusStatus {
         let status_word =
             retry_i2c_txn(now, self.slot, || self.dev.status_word())
                 .map(|data| data.0);
@@ -1086,7 +986,7 @@ impl Psu {
             }
         );
 
-        ereport::PmbusStatus {
+        ereports::pwr::PmbusStatus {
             word: status_word.ok(),
             iout: status_iout.ok(),
             vout: status_vout.ok(),
@@ -1096,49 +996,63 @@ impl Psu {
             mfr: status_mfr_specific.ok(),
         }
     }
+
+    fn ereport_fields(&self) -> EreportFields {
+        let rail = {
+            // This is a little silly, but it stops us from having to 6 separate
+            // instances of the string "V54_PSU" in the binary...
+            let mut v54_psu = *b"V54_PSUx";
+            v54_psu[7] = match self.slot {
+                Slot::Psu0 => b'0',
+                Slot::Psu1 => b'1',
+                Slot::Psu2 => b'2',
+                Slot::Psu3 => b'3',
+                Slot::Psu4 => b'4',
+                Slot::Psu5 => b'5',
+            };
+            FixedString::try_from_utf8(&v54_psu[..]).unwrap_lite()
+        };
+        EreportFields {
+            refdes: FixedStr::from_str(self.dev.i2c_device().component_id()),
+            rail,
+            slot: self.slot as u8,
+            fruid: self.fruid,
+        }
+    }
 }
 
-#[derive(Default)]
-struct Step {
-    action: Option<ActionRequired>,
-    ereport: Option<ereport::Ereport>,
-}
-
-#[derive(Copy, Clone, serde::Serialize, Default)]
+#[derive(Copy, Clone, Default, microcbor::Encode)]
 struct PsuFruid {
-    #[serde(serialize_with = "ereport::serialize_fixed_str")]
-    mfr: Option<[u8; 9]>,
-    #[serde(serialize_with = "ereport::serialize_fixed_str")]
-    mpn: Option<[u8; 17]>,
-    #[serde(serialize_with = "ereport::serialize_fixed_str")]
-    serial: Option<[u8; 12]>,
-    #[serde(serialize_with = "ereport::serialize_fixed_str")]
-    fw_rev: Option<[u8; 4]>,
+    mfr: Option<FixedString<9>>,
+    mpn: Option<FixedString<17>>,
+    serial: Option<FixedString<12>>,
+    fw_rev: Option<FixedString<4>>,
 }
 
 impl PsuFruid {
     fn refresh(&mut self, dev: &Mwocp68, psu: Slot, now: u64) {
         if self.mfr.is_none() {
-            self.mfr =
-                retry_i2c_txn(now, psu, || dev.mfr_id()).ok().map(|v| v.0);
+            self.mfr = retry_i2c_txn(now, psu, || dev.mfr_id())
+                .ok()
+                .and_then(|v| FixedString::try_from_utf8(&v.0[..]).ok());
         }
 
         if self.serial.is_none() {
             self.serial = retry_i2c_txn(now, psu, || dev.serial_number())
                 .ok()
-                .map(|v| v.0);
+                .and_then(|v| FixedString::try_from_utf8(&v.0[..]).ok());
         }
 
         if self.mpn.is_none() {
             self.mpn = retry_i2c_txn(now, psu, || dev.model_number())
                 .ok()
-                .map(|v| v.0);
+                .and_then(|v| FixedString::try_from_utf8(&v.0[..]).ok());
         }
 
         if self.fw_rev.is_none() {
             self.fw_rev = retry_i2c_txn(now, psu, || dev.firmware_revision())
                 .ok()
-                .map(|v| v.0);
+                .and_then(|v| FixedString::try_from_utf8(&v.0[..]).ok());
         }
     }
 }
@@ -1170,93 +1084,49 @@ include!(concat!(env!("OUT_DIR"), "/notifications.rs"));
 
 include!(concat!(env!("OUT_DIR"), "/i2c_config.rs"));
 
-mod ereport {
-    use super::*;
-    use serde::Serialize;
-
-    #[derive(Copy, Clone, Eq, PartialEq, Serialize)]
-    pub(super) enum Class {
-        #[serde(rename = "hw.insert.psu")]
-        Inserted,
-        #[serde(rename = "hw.remove.psu")]
-        Removed,
-        #[serde(rename = "hw.pwr.pwr_good.bad")]
-        PowerUngood,
-        #[serde(rename = "hw.pwr.pwr_good.good")]
-        PowerGood,
+ereports::declare_ereporter! {
+    struct Ereporter<Ereport> {
+        PsuInserted(PsuInsertedEreport),
+        PsuRemoved(PsuRemovedEreport),
+        PowerGood(PowerGoodEreport),
+        PowerUngood(PowerUngoodEreport)
     }
+}
 
-    #[derive(Copy, Clone, Serialize)]
-    pub(super) struct Ereport {
-        #[serde(rename = "k")]
-        pub(super) class: Class,
-        #[serde(rename = "v")]
-        pub(super) version: u32,
-        pub(super) refdes: &'static str,
-        #[serde(serialize_with = "serialize_psu_rail")]
-        pub(super) rail: Slot,
-        #[serde(serialize_with = "serialize_psu_slot")]
-        pub(super) slot: Slot,
-        pub(super) fruid: PsuFruid,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub(super) pmbus_status: Option<PmbusStatus>,
-    }
+#[derive(microcbor::Encode)]
+#[ereport(class = "hw.insert.psu", version = 0)]
+struct PsuInsertedEreport {
+    #[cbor(flatten)]
+    fields: EreportFields,
+}
 
-    #[derive(Copy, Clone, Default, Serialize)]
-    pub(super) struct PmbusStatus {
-        pub(super) word: Option<u16>,
-        pub(super) input: Option<u8>,
-        pub(super) iout: Option<u8>,
-        pub(super) vout: Option<u8>,
-        pub(super) temp: Option<u8>,
-        pub(super) cml: Option<u8>,
-        pub(super) mfr: Option<u8>,
-    }
+#[derive(microcbor::Encode)]
+#[ereport(class = "hw.remove.psu", version = 0)]
+struct PsuRemovedEreport {
+    #[cbor(flatten)]
+    fields: EreportFields,
+}
 
-    /// XXX(eliza): A "fixed length byte string" helper would be a nice thing to
-    /// have...
-    pub(super) fn serialize_fixed_str<const LEN: usize, S>(
-        s: &Option<[u8; LEN]>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        s.as_ref()
-            .and_then(|s| str::from_utf8(&s[..]).ok())
-            .serialize(serializer)
-    }
+#[derive(microcbor::Encode)]
+#[ereport(class = "hw.pwr.pwr_good.good", version = 0)]
+struct PowerGoodEreport {
+    #[cbor(flatten)]
+    fields: EreportFields,
+    pmbus_status: ereports::pwr::PmbusStatus,
+}
 
-    fn serialize_psu_slot<S>(
-        slot: &Slot,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        (*slot as u8).serialize(serializer)
-    }
+#[derive(microcbor::Encode)]
+#[ereport(class = "hw.pwr.pwr_good.bad", version = 0)]
+struct PowerUngoodEreport {
+    #[cbor(flatten)]
+    fields: EreportFields,
+    pmbus_status: ereports::pwr::PmbusStatus,
+}
 
-    fn serialize_psu_rail<S>(
-        slot: &Slot,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        // This is a little silly, but it stops us from having to 6 separate
-        // instances of the string "V54_PSU" in the binary...
-        let mut v54_psu = *b"V54_PSUx";
-        v54_psu[7] = match slot {
-            Slot::Psu0 => b'0',
-            Slot::Psu1 => b'1',
-            Slot::Psu2 => b'2',
-            Slot::Psu3 => b'3',
-            Slot::Psu4 => b'4',
-            Slot::Psu5 => b'5',
-        };
-        core::str::from_utf8(&v54_psu[..])
-            .unwrap_lite()
-            .serialize(serializer)
-    }
+#[derive(microcbor::EncodeFields)]
+struct EreportFields {
+    refdes: FixedStr<'static, 20>, // Component ID max length
+    rail: FixedString<8>,          // "V54_PSUx"
+    slot: u8,
+    fruid: PsuFruid,
 }

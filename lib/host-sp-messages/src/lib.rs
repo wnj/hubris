@@ -8,7 +8,7 @@
 #![cfg_attr(not(test), no_std)]
 
 use hubpack::SerializedSize;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_big_array::BigArray;
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use static_assertions::{const_assert, const_assert_eq};
@@ -139,6 +139,11 @@ pub enum HostToSp {
     ApobRead {
         offset: u64,
         size: u64,
+    },
+    // Indication of host OS boot progress
+    BootStage {
+        version: u64,
+        stage: u64,
     },
 }
 
@@ -466,6 +471,9 @@ pub enum InventoryData {
         mfr_firmware_data: [u8; 20],
 
         temp_sensor: SensorIndex,
+
+        /// The BRM491 doesn't actually have a power sensors; this is always set
+        /// to `u32::MAX` (but can't be removed for compatibility reasons)
         power_sensor: SensorIndex,
         voltage_sensor: SensorIndex,
         current_sensor: SensorIndex,
@@ -1121,6 +1129,23 @@ mod tests {
             ),
             (0x0f, HostToSp::GetInventoryData { index: 0 }),
             (0x10, HostToSp::KeySet { key: 0 }),
+            (
+                0x11,
+                HostToSp::ApobBegin {
+                    length: 0,
+                    algorithm: 0,
+                },
+            ),
+            (0x12, HostToSp::ApobCommit),
+            (0x13, HostToSp::ApobData { offset: 0 }),
+            (0x14, HostToSp::ApobRead { offset: 0, size: 0 }),
+            (
+                0x15,
+                HostToSp::BootStage {
+                    version: 0,
+                    stage: 0,
+                },
+            ),
         ] {
             let n = hubpack::serialize(&mut buf[..], &variant).unwrap();
             assert!(n >= 1);

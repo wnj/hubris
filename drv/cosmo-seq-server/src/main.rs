@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Server for managing the Grapefruit FPGA process.
+//! Server for managing the Cosmo sequencer FPGA.
 
 #![no_std]
 #![no_main]
@@ -11,24 +11,28 @@ use drv_cpu_seq_api::{
     PowerState, SeqError as CpuSeqError, StateChangeReason, Transition,
 };
 use drv_ice40_spi_program as ice40;
-use drv_packrat_vpd_loader::{read_vpd_and_load_packrat, Packrat};
+use drv_packrat_vpd_loader::{Packrat, read_vpd_and_load_packrat};
 use drv_spartan7_loader_api::Spartan7Loader;
 use drv_spi_api::{SpiDevice, SpiServer};
 use drv_stm32xx_sys_api::{self as sys_api, Sys};
+use fixedstr::FixedStr;
+use fmc_sequencer::{nic_api_status, seq_api_status};
 use idol_runtime::{NotificationHandler, RequestError};
 use task_jefe_api::Jefe;
 use userlib::{
-    hl, set_timer_relative, sys_get_timer, sys_recv_notification, task_slot,
-    RecvMessage,
+    RecvMessage, hl, set_timer_relative, sys_get_timer, sys_recv_notification,
+    task_slot,
 };
 
+use crate::i2c_config::MAX_COMPONENT_ID_LEN as REFDES_LEN;
 use drv_hf_api::HostFlash;
-use ringbuf::{counted_ringbuf, ringbuf_entry, Count};
+use ringbuf::{Count, counted_ringbuf, ringbuf_entry};
 
 include!(concat!(env!("OUT_DIR"), "/i2c_config.rs"));
 
 mod vcore;
 use vcore::VCore;
+mod diagnose;
 
 task_slot!(JEFE, jefe);
 task_slot!(LOADER, spartan7_loader);
@@ -73,13 +77,26 @@ enum Trace {
     },
     UnexpectedPowerOff {
         our_state: PowerState,
-        seq_state: Result<fmc_sequencer::A0Sm, u8>,
+        seq_state: Result<seq_api_status::A0Sm, u8>,
+        now: u64,
     },
     SequencerInterrupt {
         our_state: PowerState,
-        seq_state: Result<fmc_sequencer::A0Sm, u8>,
-        ifr: fmc_sequencer::IfrView,
+        seq_state: Result<seq_api_status::A0Sm, u8>,
+
+        // Whether or not the notification bit for the sequencer IRQ GPIO pin
+        // was set.
+        //
+        // This will generally indicate whether or not this is a new assertion
+        // of the IRQ line, or if we are continuing to handle a previous IRQ
+        // that hasn't cleared yet for some reason.
+        notified: bool,
     },
+    #[count(skip)]
+    SequencerIrqAsserted(bool),
+    // It's not particularly useful to count this...
+    #[count(skip)]
+    SequencerIfr(fmc_sequencer::IfrView),
     PowerDownError(drv_cpu_seq_api::SeqError),
     Coretype {
         coretype0: bool,
@@ -95,13 +112,16 @@ enum Trace {
         pwrokn: u8,
     },
     Thermtrip,
-    A0MapoInterrupt,
+    A0MapoInterrupt {
+        now: u64,
+    },
+    NicMapoInterrupt,
     SmerrInterrupt,
     PmbusAlert {
         now: u64,
     },
     UnexpectedInterrupt,
-    CPUPresent(bool),
+    CPUNotPresent,
 }
 counted_ringbuf!(Trace, 128, Trace::None);
 
@@ -152,21 +172,57 @@ const SP5R4_PULL: sys_api::Pull = sys_api::Pull::None;
 
 use gpio_irq_pins::SEQ_IRQ;
 
-////////////////////////////////////////////////////////////////////////////////
-
 /// Helper type which includes both sequencer and NIC state machine states
 struct StateMachineStates {
-    seq: Result<fmc_sequencer::A0Sm, u8>,
-    nic: Result<fmc_sequencer::NicSm, u8>,
+    seq: Result<seq_api_status::A0Sm, u8>,
+    nic: Result<nic_api_status::NicSm, u8>,
 }
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     // Populate packrat with our mac address and identity.
     let packrat = Packrat::from(PACKRAT.get_task_id());
     read_vpd_and_load_packrat(&packrat, I2C.get_task_id());
 
-    match init(packrat) {
+    let mut ereporter = Ereporter::claim_static_resources(packrat);
+
+    //
+    // Apply the configuration mitigation on the BMR491, if required. This
+    // is an external device access and may fail. We'll attempt it thrice
+    // and then allow boot to continue.
+    //
+    {
+        use drv_i2c_devices::bmr491::{Bmr491, ExternalInputVoltageProtection};
+
+        let dev = i2c_config::devices::bmr491_u80(I2C.get_task_id());
+        let driver = Bmr491::new(&dev, 0);
+
+        // Cosmo provides external undervoltage protection that kicks in at a
+        // lower voltage than we'd like to tolerate, so, request additional
+        // protection from the mitigation code.
+        let protection = ExternalInputVoltageProtection::CutoffBelow40V;
+
+        let (failures, last_cause, succeeded) =
+            match driver.apply_mitigation_for_rma2402311(protection) {
+                Ok(r) => (r.failures, r.last_failure, true),
+                Err(e) => (e.retries, Some(e.last_cause), false),
+            };
+
+        if let Some(last_cause) = last_cause {
+            // Report the failure even if we eventually succeeded.
+            let ereport = ereports::pwr::Bmr491MitigationFailure {
+                refdes: FixedStr::<{ REFDES_LEN }>::from_str(
+                    dev.component_id(),
+                ),
+                failures,
+                last_cause,
+                succeeded,
+            };
+            let _ = ereporter.deliver_ereport(&ereport);
+        }
+    }
+
+    match init(ereporter) {
         // Set up everything nicely, time to start serving incoming messages.
         Ok(mut server) => {
             // Enable the backplane PCIe clock if requested
@@ -208,7 +264,7 @@ fn main() -> ! {
     }
 }
 
-fn init(packrat: Packrat) -> Result<ServerImpl, SeqError> {
+fn init(ereporter: Ereporter) -> Result<ServerImpl, SeqError> {
     let sys = sys_api::Sys::from(SYS.get_task_id());
 
     // Pull the fault line low while we're loading
@@ -262,7 +318,7 @@ fn init(packrat: Packrat) -> Result<ServerImpl, SeqError> {
     // Set up the checksum registers for the Spartan7 FPGA
     let token = loader.get_token();
     let info = fmc_periph::info::Info::new(token);
-    let short_checksum = gen::SPARTAN7_FPGA_BITSTREAM_CHECKSUM[..4]
+    let short_checksum = generated::SPARTAN7_FPGA_BITSTREAM_CHECKSUM[..4]
         .try_into()
         .unwrap();
     info.fpga_checksum
@@ -299,7 +355,7 @@ fn init(packrat: Packrat) -> Result<ServerImpl, SeqError> {
     // Turn on the chassis LED!
     sys.gpio_set(SP_CHASSIS_STATUS_LED);
 
-    Ok(ServerImpl::new(loader, packrat))
+    Ok(ServerImpl::new(loader, ereporter))
 }
 
 /// Configures the front FPGA pins and holds it in reset
@@ -349,7 +405,7 @@ fn init_front_fpga<S: SpiServer>(
         }
     };
 
-    if sha_out != gen::FRONT_FPGA_BITSTREAM_CHECKSUM {
+    if sha_out != generated::FRONT_FPGA_BITSTREAM_CHECKSUM {
         // Drop the device into reset and hold it there
         sys.gpio_reset(config.creset);
         hl::sleep_for(1);
@@ -373,28 +429,28 @@ fn init_front_fpga<S: SpiServer>(
 #[allow(unused)]
 struct ServerImpl {
     state: PowerState,
+    /// The Hubris tick at which we transitioned to the current state.
+    since: u64,
     jefe: Jefe,
     sys: Sys,
     hf: HostFlash,
     seq: fmc_sequencer::Sequencer,
     espi: fmc_periph::espi::Espi,
+    debug: fmc_periph::debug_ctrl::DebugCtrl,
     vcore: VCore,
-    /// Static buffer for encoding ereports. This is a static so that we don't
-    /// have it on the stack when encoding ereports.
-    ereport_buf: &'static mut [u8; EREPORT_BUF_LEN],
+    ereporter: Ereporter,
 }
-
-const EREPORT_BUF_LEN: usize = 256;
 
 impl ServerImpl {
     fn new(
         loader: drv_spartan7_loader_api::Spartan7Loader,
-        packrat: Packrat,
+        ereporter: Ereporter,
     ) -> Self {
         let now = sys_get_timer().now;
 
         let seq = fmc_sequencer::Sequencer::new(loader.get_token());
         let espi = fmc_periph::espi::Espi::new(loader.get_token());
+        let debug = fmc_periph::debug_ctrl::DebugCtrl::new(loader.get_token());
 
         ringbuf_entry!(Trace::Startup {
             early_power_rdbks: (&seq.early_power_rdbks).into(),
@@ -408,22 +464,17 @@ impl ServerImpl {
         let jefe = Jefe::from(JEFE.get_task_id());
         jefe.set_state(PowerState::A2 as u32);
 
-        let ereport_buf = {
-            use static_cell::ClaimOnceCell;
-            static EREPORT_BUF: ClaimOnceCell<[u8; EREPORT_BUF_LEN]> =
-                ClaimOnceCell::new([0; EREPORT_BUF_LEN]);
-            EREPORT_BUF.claim()
-        };
-
         ServerImpl {
             state: PowerState::A2,
+            since: now,
             jefe,
             sys: Sys::from(SYS.get_task_id()),
             hf: HostFlash::from(HF.get_task_id()),
             seq,
             espi,
-            vcore: VCore::new(I2C.get_task_id(), packrat),
-            ereport_buf,
+            debug,
+            vcore: VCore::new(I2C.get_task_id()),
+            ereporter,
         }
     }
 
@@ -469,7 +520,7 @@ impl ServerImpl {
             now,
         });
 
-        use fmc_sequencer::A0Sm;
+        use seq_api_status::A0Sm;
         match (self.get_state_impl(), state) {
             (PowerState::A2, PowerState::A0) => {
                 // Reset edge counters in the sequencer
@@ -501,15 +552,18 @@ impl ServerImpl {
                         Ok(A0Sm::EnableGrpA) => {
                             // hardware-cosmo#658 prevents us from checking `CPU_PRESENT`
                             // at `A0Sm::ENABLE_GRP_A` time on rev-a boards
-                            if cfg!(target_board = "cosmo-a") {
-                                ringbuf_entry!(Trace::CPUPresent(true));
-                            } else {
+                            if !cfg!(target_board = "cosmo-a") {
                                 let present =
                                     self.sys.gpio_read(SP5_TO_SP_PRESENT_L)
                                         == 0;
-                                ringbuf_entry!(Trace::CPUPresent(present));
 
                                 if !present {
+                                    ringbuf_entry!(Trace::CPUNotPresent);
+                                    let _ = self.ereporter.deliver_ereport(
+                                        &ereports::cpu::CpuMissing {
+                                            cpu: &HOST_CPU_REFDES,
+                                        },
+                                    );
                                     err = CpuSeqError::CPUNotPresent;
                                     break;
                                 }
@@ -521,6 +575,13 @@ impl ServerImpl {
                 }
 
                 if !okay {
+                    // Log a fault diagnosis in the ringbuf
+                    diagnose::a0_fault(
+                        &self.seq,
+                        diagnose::DiagnoseReason::FailedToSequence,
+                        sys_get_timer().now,
+                    );
+
                     // We'll return to A2, leaving jefe and our local state
                     // unchanged (since they're set after this block).
                     self.log_state_registers();
@@ -549,26 +610,35 @@ impl ServerImpl {
                 });
 
                 // From sp5-mobo-guide-56870_1.1.pdf table 72
-                match (coretype0, coretype1, coretype2) {
+                let coretype_ok = match (coretype0, coretype1, coretype2) {
                     // These correspond to Type-2 and Type-3
-                    (true, false, true) | (true, false, false) => (),
+                    (true, false, true) | (true, false, false) => true,
                     // Reject all other combos and return to A0
-                    _ => {
-                        self.seq.power_ctrl.modify(|m| m.set_a0_en(false));
-                        return Err(CpuSeqError::UnrecognizedCPU);
-                    }
+                    _ => false,
                 };
 
                 // From sp5-mobo-guide-56870_1.1.pdf table 73
-                match (sp5r1, sp5r2, sp5r3, sp5r4) {
+                let sp5rx_ok =
                     // There is only combo we accept here
-                    (true, false, false, false) => (),
-                    // Reject all other combos and return to A0
-                    _ => {
-                        self.seq.power_ctrl.modify(|m| m.set_a0_en(false));
-                        return Err(CpuSeqError::UnrecognizedCPU);
-                    }
-                };
+                    (sp5r1, sp5r2, sp5r3, sp5r4) == (true, false, false, false);
+
+                if !(coretype_ok && sp5rx_ok) {
+                    self.seq.power_ctrl.modify(|m| m.set_a0_en(false));
+                    let ereport = ereports::cpu::UnsupportedCpu {
+                        cpu: &HOST_CPU_REFDES,
+                        coretype: ereports::cpu::CpuTypeBits {
+                            bits: [coretype0, coretype1, coretype2],
+                            ok: coretype_ok,
+                        },
+                        rev: ereports::cpu::CpuTypeBits {
+                            bits: [sp5r1, sp5r2, sp5r3, sp5r4],
+                            ok: sp5rx_ok,
+                        },
+                    };
+                    let _ = self.ereporter.deliver_ereport(&ereport);
+                    return Err(CpuSeqError::UnrecognizedCPU);
+                }
+
                 // Turn on the voltage regulator undervolt alerts.
                 self.enable_sequencer_interrupts();
 
@@ -618,23 +688,24 @@ impl ServerImpl {
             // externally-requested transitions.
             (PowerState::A0PlusHP, PowerState::A0)
             | (PowerState::A2PlusFans, PowerState::A2) => {
-                return Ok(Transition::Unchanged)
+                return Ok(Transition::Unchanged);
             }
             // If we are already in the requested state, return `Unchanged`.
             (current, requested) if current == requested => {
-                return Ok(Transition::Unchanged)
+                return Ok(Transition::Unchanged);
             }
 
             _ => return Err(CpuSeqError::IllegalTransition),
         }
 
-        self.set_state_internal(state);
+        self.set_state_internal(state, now);
         Ok(Transition::Changed)
     }
 
     /// Updates our internal `state` and the global state in `jefe`
-    fn set_state_internal(&mut self, state: PowerState) {
+    fn set_state_internal(&mut self, state: PowerState, now: u64) {
         self.state = state;
+        self.since = now;
         self.jefe.set_state(state as u32);
         self.poke_timer();
     }
@@ -648,6 +719,10 @@ impl ServerImpl {
     fn poll_interval(&self) -> Option<u32> {
         match self.state {
             PowerState::A0 => Some(10),
+            // The FPGA still wants our attention! Come back soon!
+            _ if self.is_seq_irq_asserted() => Some(10),
+            // we are hoping that a VRM fault will be clearable soon...
+            _ if self.vcore.is_still_faulted() => Some(100),
             PowerState::A0PlusHP => Some(1000),
             _ => None,
         }
@@ -673,31 +748,25 @@ impl ServerImpl {
     fn enable_sequencer_interrupts(&mut self) {
         // Clear `ifr` in case spurious flags accumulated while disabled
         self.seq.ifr.modify(|m| {
-            m.set_fanfault(false);
-            m.set_thermtrip(false);
-            m.set_smerr_assert(false);
-            m.set_a0mapo(false);
-            m.set_nicmapo(false);
-            m.set_amd_pwrok_fedge(false);
-            m.set_amd_rstn_fedge(false);
+            // IFR flags are write-1-clear.
+            m.set_fanfault(true);
+            m.set_thermtrip(true);
+            m.set_smerr_assert(true);
+            m.set_a0mapo(true);
+            m.set_nicmapo(true);
+            m.set_amd_pwrok_fedge(true);
+            m.set_amd_rstn_fedge(true);
         });
 
         let _ = self.sys.gpio_irq_control(
             notifications::SEQ_IRQ_MASK,
             sys_api::IrqControl::Enable,
         );
-        // Enable the undervoltage warning PMBus alert from the Vcore
-        // regulators.
-        //
-        // Yes, we just ignore the error here --- while that seems a bit
-        // sketchy, but what else can we do? It seems pretty bad to panic and
-        // say "nope, the computer won't turn on" because we weren't able to do
-        // an I2C transaction to turn on an interrupt that we only use for
-        // monitoring for faults. The initialize method will retry internally a
-        // few times, so we should power through any transient I2C messiness,
-        // and any I2C errors that occur get logged in the `vcore` module's
-        // ringbuf.
-        let _ = self.vcore.initialize_uv_warning();
+        // Configure PMBus alerts from the Vcore regulators. This will attempt
+        // to set a limit for the input undervoltage warning, and mask out the
+        // (spurious) output overcurrent warning (which must be set to a
+        // threshold that is not indicative of a real fault).
+        self.vcore.initialize_pmbus_alerts();
         self.seq.ier.modify(|m| {
             m.set_fanfault(true);
             m.set_thermtrip(true);
@@ -733,16 +802,12 @@ impl ServerImpl {
 
     fn handle_sequencer_interrupt(&mut self) {
         let ifr = self.seq.ifr.view();
-
-        let state = self.log_state_registers();
-        ringbuf_entry!(Trace::SequencerInterrupt {
-            our_state: self.state,
-            seq_state: state.seq,
-            ifr,
-        });
+        ringbuf_entry!(Trace::SequencerIfr(ifr));
+        let now = sys_get_timer().now;
 
         enum InternalAction {
             Reset,
+            NicMapo,
             ThermTrip,
             Smerr,
             Mapo,
@@ -750,11 +815,22 @@ impl ServerImpl {
             Unexpected,
         }
 
-        // We check these in lowest to highest priority. We start with
-        // reset since we expect the CPU to handle that nicely.
-        // Thermal trip is a terminal state in that we log it but don't
-        // actually make any changes to the sequencer.
-        // SMERR is treated as a higher priority than MAPO arbitrarily.
+        // We check these in lowest to highest priority:
+        //
+        // 1. PMBus alerts from the VCore voltage regulators are recorded and
+        //    produce an ereport, but don't change the power state directly,
+        //    as they may just be warnings that don't represent a loss of
+        //    power. If a PMBus fault causes the VRM(s) to deassert POWER_GOOD,
+        //    that also results in a MAPO from the FPGA, so just seeing the
+        //    PMBus alert doesn't transition our state.
+        // 2. A NIC MAPO will just transition our state from A0+HP to A0, as
+        //    the host is responsible for NIC sequencing. Since other
+        //    interrupts we handle will transition us to lower power states,
+        //    they have priority over a NIC MAPO that just sends us to A0.
+        // 3. We expect the CPU to handle reset nicely, so we just log that.
+        // 4. Thermal trip is a terminal state in that we log it but don't
+        //    actually make any changes to the sequencer.
+        // 5. SMERR is treated as a higher priority than MAPO arbitrarily.
         // we probably(?) won't see multiple of these set at a time but
         // it's important to account for that case;
 
@@ -774,14 +850,13 @@ impl ServerImpl {
             //
             // See also:
             // https://github.com/oxidecomputer/quartz/blob/bdc5fb31e1905a1b66c19647fe2d156dd1b97b7b/hdl/projects/cosmo_seq/sequencer/sequencer_regs.vhd#L243-L246
-            let now = sys_get_timer().now;
             ringbuf_entry!(Trace::PmbusAlert { now });
-            let which_rails = vcore::Rails {
-                vddcr_cpu0: ifr.pwr_cont1_to_fpga1_alert,
-                vddcr_cpu1: ifr.pwr_cont2_to_fpga1_alert,
+            let which_vrms = vcore::Vrms {
+                pwr_cont1: ifr.pwr_cont1_to_fpga1_alert,
+                pwr_cont2: ifr.pwr_cont2_to_fpga1_alert,
             };
             self.vcore
-                .handle_pmbus_alert(which_rails, now, self.ereport_buf);
+                .handle_pmbus_alert(which_vrms, now, &mut self.ereporter);
 
             // We need not instruct the sequencer to reset. PMBus alerts from
             // the RAA229620As are divided into two categories, "warnings" and
@@ -790,6 +865,36 @@ impl ServerImpl {
             // POWER_GOOD is deasserted, the sequencer FPGA will notice that and
             // generate a subsequent IRQ, which is handled separately. So, all
             // we need to do here is proceed and handle any other interrupts.
+            //
+            // However, the only way to make the pins deassert (and thus, the
+            // IRQ go away) is to clear the faults in the regulator.
+            // N.B.: unlike other FPGA sequencer alerts, we cannot clear the
+            // IFR bits for these; they are hot as long as the PMALERT pin from
+            // the RAA229620As is asserted.
+            //
+            // Per the RAA229620A datasheet (R16DS0309EU0200 Rev.2.00, page 36),
+            // clearing the fault in the regulator will deassert PMALERT_L,
+            // releasing the IRQ, but the fault bits to be reset if the fault
+            // condition still exists. This means that if the fault condition
+            // has not cleared yet, the VRM will just immediately reassert
+            // PMALERT_L. Therefore, if we have an ongoing fault condition, we
+            // will mask out the IER bits for the whichever VRM(s) are presently
+            // asserting PMALERT_L, and continue trying to clear the fault in
+            // the timer loop. If the fault clears, we shall then re-enable
+            // interrupts for those VRMs.
+            //
+            // The `vcore` module tells us whether any faults have successfully
+            // cleared. Set the IER bits based on that.
+            let vcore::Vrms {
+                pwr_cont1,
+                pwr_cont2,
+            } = self.vcore.can_we_unmask_any_vrm_irqs_again();
+            self.seq.ier.modify(|ier| {
+                ier.set_pwr_cont1_to_fpga1_alert(pwr_cont1);
+                ier.set_pwr_cont2_to_fpga1_alert(pwr_cont2);
+            });
+
+            // Nothing else need be done unles other IRQs have also fired.
             action = InternalAction::None;
         }
 
@@ -797,49 +902,97 @@ impl ServerImpl {
             let rstn = self.seq.amd_reset_fedges.counts();
             let pwrokn = self.seq.amd_pwrok_fedges.counts();
 
-            // counters and ifr are cleared in the A2 -> A0 transition
+            // counters are cleared in the A2 -> A0 transition.
             // host_sp_comms will be notified of this change and will
             // call back into this task to reboot the system (going to
             // A2 then back into A0)
             ringbuf_entry!(Trace::ResetCounts { rstn, pwrokn });
+
+            // Clear the IFR bits to ack the IRQ.
+            self.seq.ifr.modify(|h| {
+                h.set_amd_pwrok_fedge(ifr.amd_pwrok_fedge);
+                h.set_amd_rstn_fedge(ifr.amd_rstn_fedge);
+            });
             action = InternalAction::Reset;
+            // TODO probably want an ereport here too!
+        }
+
+        if ifr.nicmapo {
+            self.seq.ifr.modify(|h| h.set_nicmapo(true));
+            ringbuf_entry!(Trace::NicMapoInterrupt);
+            action = InternalAction::NicMapo;
+            // TODO(eliza): ereport!!!
         }
 
         if ifr.thermtrip {
-            self.seq.ifr.modify(|h| h.set_thermtrip(false));
+            self.seq.ifr.modify(|h| h.set_thermtrip(true));
             ringbuf_entry!(Trace::Thermtrip);
             action = InternalAction::ThermTrip;
-            // Great place for an ereport?
+            let _ = self.ereporter.deliver_ereport(&ereports::cpu::Thermtrip {
+                cpu: &HOST_CPU_REFDES,
+                state: self.ereport_current_state(),
+            });
         }
 
         if ifr.a0mapo {
+            diagnose::a0_fault(
+                &self.seq,
+                diagnose::DiagnoseReason::MapoDetected,
+                now,
+            );
             self.log_pg_registers();
-            self.seq.ifr.modify(|h| h.set_a0mapo(false));
-            ringbuf_entry!(Trace::A0MapoInterrupt);
+            self.seq.ifr.modify(|h| h.set_a0mapo(true));
+            ringbuf_entry!(Trace::A0MapoInterrupt { now });
             action = InternalAction::Mapo;
             // Great place for an ereport?
         }
 
         if ifr.smerr_assert {
-            self.seq.ifr.modify(|h| h.set_smerr_assert(false));
+            self.seq.ifr.modify(|h| h.set_smerr_assert(true));
             ringbuf_entry!(Trace::SmerrInterrupt);
             action = InternalAction::Smerr;
-            // Great place for an ereport?
+            let _ = self.ereporter.deliver_ereport(&ereports::cpu::Smerr {
+                cpu: &HOST_CPU_REFDES,
+                state: self.ereport_current_state(),
+            });
         }
         // Fan Fault is unconnected
-        // NIC MAPO is unconnected
 
         match action {
             InternalAction::Reset => {
                 // host_sp_comms will be notified of this change and will
                 // call back into this task to reboot the system (going to
                 // A2 then back into A0)
-                self.set_state_internal(PowerState::A0Reset);
+                ringbuf_entry!(Trace::SetState {
+                    prev: Some(self.state),
+                    next: PowerState::A0Reset,
+                    why: StateChangeReason::CpuReset,
+                    now,
+                });
+                self.set_state_internal(PowerState::A0Reset, now);
+            }
+            InternalAction::NicMapo => {
+                // Presumably we are in A0+HP, so send us back to A0 so that the
+                // thermal loop will stop trying to talk to the NIC, and hope
+                // the host resequences it.
+                ringbuf_entry!(Trace::SetState {
+                    prev: Some(self.state),
+                    next: PowerState::A0,
+                    why: StateChangeReason::NicMapo,
+                    now,
+                });
+                self.set_state_internal(PowerState::A0, now);
             }
             InternalAction::ThermTrip => {
                 // This is a terminal state; we set our state to `A0Thermtrip`
                 // but do not expect any other task to take action right now
-                self.set_state_internal(PowerState::A0Thermtrip);
+                ringbuf_entry!(Trace::SetState {
+                    prev: Some(self.state),
+                    next: PowerState::A0Thermtrip,
+                    why: StateChangeReason::Overheat,
+                    now,
+                });
+                self.set_state_internal(PowerState::A0Thermtrip, now);
             }
             InternalAction::Mapo => {
                 // This is a terminal state (for now)
@@ -857,6 +1010,17 @@ impl ServerImpl {
                 ringbuf_entry!(Trace::UnexpectedInterrupt);
             }
         };
+    }
+
+    fn is_seq_irq_asserted(&self) -> bool {
+        self.sys.gpio_read(SEQ_IRQ) == 0
+    }
+
+    fn ereport_current_state(&self) -> ereports::pwr::CurrentState {
+        ereports::pwr::CurrentState {
+            cur: self.state,
+            since_ms: self.since,
+        }
     }
 }
 
@@ -915,22 +1079,57 @@ impl idl::InOrderSequencerImpl for ServerImpl {
         Ok(self.espi.last_post_code.payload())
     }
 
+    fn post_code_buffer_len(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        Ok(self.espi.post_code_count.count())
+    }
+
+    fn get_post_code(
+        &mut self,
+        _: &RecvMessage,
+        index: u32,
+    ) -> Result<u32, RequestError<core::convert::Infallible>> {
+        self.espi.post_code_buffer.get(index as usize).ok_or(
+            RequestError::Fail(idol_runtime::ClientError::BadMessageContents),
+        )
+    }
+
     fn gpio_edge_count(
         &mut self,
         _: &RecvMessage,
     ) -> Result<u32, RequestError<core::convert::Infallible>> {
-        Err(RequestError::Fail(
-            idol_runtime::ClientError::BadMessageContents,
-        ))
+        Ok(self.debug.sp5_dbg2_toggle_counter.cnts())
     }
 
     fn gpio_cycle_count(
         &mut self,
         _: &RecvMessage,
     ) -> Result<u32, RequestError<core::convert::Infallible>> {
-        Err(RequestError::Fail(
-            idol_runtime::ClientError::BadMessageContents,
-        ))
+        Ok(self.debug.sp5_dbg2_toggle_timer.cnts())
+    }
+
+    fn enable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        self.debug.uart_control.modify(|b| {
+            b.set_sp5_to_header(true);
+            b.set_use_debug_header(true);
+        });
+        Ok(())
+    }
+
+    fn disable_console_redirect(
+        &mut self,
+        _: &RecvMessage,
+    ) -> Result<(), RequestError<core::convert::Infallible>> {
+        self.debug.uart_control.modify(|b| {
+            b.set_sp5_to_header(false);
+            b.set_use_debug_header(false);
+        });
+        Ok(())
     }
 }
 
@@ -940,15 +1139,77 @@ impl NotificationHandler for ServerImpl {
     }
 
     fn handle_notification(&mut self, bits: userlib::NotificationBits) {
-        if bits.check_notification_mask(notifications::SEQ_IRQ_MASK) {
-            self.handle_sequencer_interrupt();
+        // Check the actual status of the GPIO pin to determine if we must
+        // handle the sequencer IRQ, rather than the status of the notification
+        // bit.
+        //
+        // This is necessary because the STM32 external interrupt (EXTI)
+        // peripheral, which produces interrupts from GPIO pin states, cannot
+        // produce level-triggered interrupts (only edge-triggered). Therefore,
+        // we receive a notification when the pin is asserted, but we do not
+        // receive a subsequent notification if it *remains* asserted. The
+        // `handle_sequencer_interrupts` function will clear (acknowledge) any
+        // interrupt flags that it observes to be set in the FPGA's interrupt
+        // flags register (IFR), but because these flags are set based on the
+        // state of multiple signals routed to the FPGA, it is always possible
+        // that additional flags will be set *after* we have read the interrupt
+        // flags.
+        //
+        // To compensate for this, we are about to call
+        // `handle_sequencer_interrupt` a few times in a loop, in case any flags
+        // are set after we have read the register the first time. Naively, we
+        // would loop until the IRQ pin is deasserted. However, in the event
+        // that the IRQ pin *never* clears, that would result in an infinite
+        // loop, starving other lower-priority tasks. Therefore, we only loop a
+        // few times here, even if the IRQ is still asserted. If it remains
+        // asserted after a few iterations, we shall set a 10 ms timer to ensure
+        // that we are notified again shortly, giving other tasks an opportunity
+        // to run. When that timer fires, we will land here again.
+        //
+        // Therefore, we may arrive here *without* actually having received a
+        // notification with `notificatios::SEQ_IRQ_MASK` actually set, but with
+        // the IRQ pin still asserted. In that case, we still wish to perform
+        // the same interrupt-handling that we would do if the EXTI notification
+        // was posted.
+        if self.is_seq_irq_asserted() {
+            let state = self.log_state_registers();
+            ringbuf_entry!(Trace::SequencerInterrupt {
+                our_state: self.state,
+                seq_state: state.seq,
+                // Were we notified for the first time, or are we continuing to
+                // handle an ongoing assertion of the IRQ pin?
+                notified: bits
+                    .check_notification_mask(notifications::SEQ_IRQ_MASK),
+            });
+
+            // Read the IFR register and handle any pending interrupts. We will
+            // loop a few times here in case additional bits are set whilst we
+            // were handling previous ones, but only do this a few times to
+            // avoid an infinite loop. In the (unlikely!) case that the IRQ is
+            // still asserted after three iterations of this, we will be back in
+            // 10ms to continue handling any additional interrupt flags, so
+            // don't worry.
+            //
+            // N.B. that 3 is chosen completely arbitrarily
+            for _ in 0..3 {
+                self.handle_sequencer_interrupt();
+                if !self.is_seq_irq_asserted() {
+                    // We're done here!
+                    break;
+                }
+            }
+
+            // Record whether or not our antics have cleared the IRQ.
+            ringbuf_entry!(Trace::SequencerIrqAsserted(
+                self.is_seq_irq_asserted()
+            ));
         }
 
         if !bits.has_timer_fired(notifications::TIMER_MASK) {
             return;
         }
         let state = self.log_state_registers();
-        use fmc_sequencer::{A0Sm, NicSm};
+        use fmc_sequencer::{nic_api_status::NicSm, seq_api_status::A0Sm};
 
         // Detect when the NIC comes online
         // TODO: should we handle the NIC powering down while the main CPU
@@ -961,15 +1222,35 @@ impl NotificationHandler for ServerImpl {
             .unwrap(); // this should be infallible
         }
 
+        if self.vcore.is_still_faulted() {
+            let vcore::Vrms {
+                pwr_cont1,
+                pwr_cont2,
+            } = self.vcore.can_we_unmask_any_vrm_irqs_again(); // ...please?
+
+            // okay, great!
+            self.seq.ier.modify(|ier| {
+                ier.set_pwr_cont1_to_fpga1_alert(pwr_cont1);
+                ier.set_pwr_cont2_to_fpga1_alert(pwr_cont2);
+            });
+        }
+
         // If Hubris thinks the system is up, do some basic checks
         if matches!(self.state, PowerState::A0 | PowerState::A0PlusHP) {
             // Detect the FPGA powering off without us
             if state.seq != Ok(A0Sm::Done) {
+                let now = sys_get_timer().now;
                 ringbuf_entry!(Trace::UnexpectedPowerOff {
                     our_state: self.state,
                     seq_state: state.seq,
+                    now,
                 });
                 self.log_pg_registers();
+                diagnose::a0_fault(
+                    &self.seq,
+                    diagnose::DiagnoseReason::UnexpectedPowerOff,
+                    now,
+                );
 
                 self.emergency_a2(StateChangeReason::Unknown);
             }
@@ -981,12 +1262,33 @@ impl NotificationHandler for ServerImpl {
 
 ////////////////////////////////////////////////////////////////////////////////
 
+ereports::declare_ereporter! {
+    pub(crate) struct Ereporter<SeqEreport> {
+        PmbusAlert(ereports::pwr::PmbusAlert<vcore::Rail, { REFDES_LEN }>),
+        Bmr491MitigationFailure(
+            ereports::pwr::Bmr491MitigationFailure<{ REFDES_LEN }>
+        ),
+        Thermtrip(ereports::cpu::Thermtrip),
+        Smerr(ereports::cpu::Smerr),
+        UnsupportedCpu(ereports::cpu::UnsupportedCpu<3, 4>),
+        CpuMissing(ereports::cpu::CpuMissing),
+    }
+}
+
+static HOST_CPU_REFDES: ereports::cpu::HostCpuRefdes =
+    ereports::cpu::HostCpuRefdes {
+        refdes: fixedstr::FixedString::from_str("P0"),
+        dev_id: fixedstr::FixedString::from_str("sp5-host-cpu"),
+    };
+
+////////////////////////////////////////////////////////////////////////////////
+
 mod idl {
     use drv_cpu_seq_api::StateChangeReason;
     include!(concat!(env!("OUT_DIR"), "/server_stub.rs"));
 }
 
-mod gen {
+mod generated {
     include!(concat!(env!("OUT_DIR"), "/cosmo_fpga.rs"));
 }
 

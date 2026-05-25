@@ -24,7 +24,7 @@ use drv_i2c_devices::tps546b24a::*;
 use pmbus::Phase;
 use ringbuf::*;
 use task_power_api::{
-    Bmr491Event, PmbusValue, RawPmbusBlock, RenesasBlackbox, MAX_BLOCK_LEN,
+    Bmr491Event, MAX_BLOCK_LEN, PmbusValue, RawPmbusBlock, RenesasBlackbox,
 };
 use task_sensor_api as sensor_api;
 use userlib::units::*;
@@ -185,6 +185,7 @@ impl Device {
     ) -> Result<Amperes, ResponseCode> {
         match &self {
             Device::Raa229618(dev) => Ok(dev.read_phase_current(phase)?),
+            Device::Raa229620A(dev) => Ok(dev.read_phase_current(phase)?),
             Device::Isl68224(dev) => Ok(dev.read_phase_current(phase)?),
             _ => Err(ResponseCode::OperationNotSupported),
         }
@@ -226,7 +227,7 @@ impl Device {
             | Device::Lm5066(_)
             | Device::Lm5066I(_)
             | Device::Max5970(_) => {
-                return Err(ResponseCode::OperationNotSupported)
+                return Err(ResponseCode::OperationNotSupported);
             }
         };
         Ok(v)
@@ -245,7 +246,7 @@ impl Device {
             | Device::Max5970(..)
             | Device::Lm5066(..)
             | Device::Lm5066I(..) => {
-                return Err(ResponseCode::OperationNotSupported)
+                return Err(ResponseCode::OperationNotSupported);
             }
         };
         Ok(v)
@@ -496,6 +497,7 @@ macro_rules! mwocp68_controller {
     any(target_board = "psc-b", target_board = "psc-c"),
     path = "bsp/psc_bc.rs"
 )]
+#[cfg_attr(target_board = "observer-a", path = "bsp/observer_a.rs")]
 #[cfg_attr(
     any(
         target_board = "sidecar-b",
@@ -517,7 +519,7 @@ mod bsp;
 
 ////////////////////////////////////////////////////////////////////////////////
 
-#[export_name = "main"]
+#[unsafe(export_name = "main")]
 fn main() -> ! {
     let i2c_task = I2C.get_task_id();
 
@@ -912,16 +914,15 @@ impl idl::InOrderPowerImpl for ServerImpl {
             .iter()
             .zip(self.devices.iter_mut())
             .find(|(c, _)| c.voltage == rail)
+            && let Some(phases) = c.phases
         {
-            if let Some(phases) = c.phases {
-                let phase: usize = phase as usize;
+            let phase: usize = phase as usize;
 
-                if phase < phases.len() {
-                    return match dev.read_phase_current(Phase(phases[phase])) {
-                        Err(e) => Err(e.into()),
-                        Ok(val) => Ok(val.0),
-                    };
-                }
+            if phase < phases.len() {
+                return match dev.read_phase_current(Phase(phases[phase])) {
+                    Err(e) => Err(e.into()),
+                    Ok(val) => Ok(val.0),
+                };
             }
         }
 
@@ -1125,10 +1126,7 @@ impl idl::InOrderPowerImpl for ServerImpl {
         let dev = self
             .devices
             .iter()
-            .find(|d| {
-                d.i2c_device().address == addr
-                    && matches!(d, Device::Raa229618(..) | Device::Isl68224(..))
-            })
+            .find(|d| d.i2c_device().address == addr && is_rendmp_device(d))
             .ok_or(ResponseCode::NoDevice)?
             .i2c_device();
 
@@ -1150,10 +1148,7 @@ impl idl::InOrderPowerImpl for ServerImpl {
         let dev = self
             .devices
             .iter()
-            .find(|d| {
-                d.i2c_device().address == addr
-                    && matches!(d, Device::Raa229618(..) | Device::Isl68224(..))
-            })
+            .find(|d| d.i2c_device().address == addr && is_rendmp_device(d))
             .ok_or(ResponseCode::NoDevice)?
             .i2c_device();
 
@@ -1170,6 +1165,13 @@ impl idl::InOrderPowerImpl for ServerImpl {
         )?;
         Ok(())
     }
+}
+
+fn is_rendmp_device(device: &Device) -> bool {
+    matches!(
+        device,
+        Device::Raa229618(..) | Device::Raa229620A(..) | Device::Isl68224(..)
+    )
 }
 
 /// Claims a mutable buffer of Devices, built from CONTROLLER_CONFIG.

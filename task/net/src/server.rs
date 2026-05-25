@@ -5,7 +5,7 @@
 use crate::bsp_support;
 use crate::generated::{self, SOCKET_COUNT};
 use crate::notifications;
-use crate::{idl, link_local_iface_addr, MacAddressBlock};
+use crate::{MacAddressBlock, idl, link_local_iface_addr};
 
 use drv_stm32h7_eth as eth;
 use enum_map::Enum;
@@ -43,6 +43,11 @@ enum Trace {
         #[count(children)]
         vid: VLanId,
     },
+    QueueWatchdogFired {
+        #[count(children)]
+        vid: VLanId,
+        socket_index: usize,
+    },
 }
 counted_ringbuf!(Trace, 16, Trace::None);
 
@@ -51,7 +56,7 @@ use heapless::Vec;
 use smoltcp::iface::{Interface, SocketHandle, SocketStorage};
 use smoltcp::socket::udp;
 use smoltcp::wire::{EthernetAddress, Ipv6Cidr};
-use userlib::{sys_get_timer, sys_post, sys_refresh_task_id, UnwrapLite};
+use userlib::{UnwrapLite, sys_get_timer, sys_post, sys_refresh_task_id};
 use zerocopy::byteorder::U16;
 
 /// Implementation of the Net Idol interface.
@@ -430,6 +435,10 @@ impl<E: DeviceExt> VLanState<E> {
                 s.close();
                 s.bind(e).unwrap_lite();
                 changed = true;
+                ringbuf_entry!(Trace::QueueWatchdogFired {
+                    vid: self.vid,
+                    socket_index,
+                });
 
                 // Reset the watchdog, so it doesn't fire right away
                 self.queue_watchdog[socket_index] = QueueWatchdog::Nominal;
@@ -709,7 +718,7 @@ where
                         return Ok(vlan.device.make_meta(
                             endp.port,
                             body_len,
-                            endp.addr.try_into().map_err(|_| ()).unwrap(),
+                            endp.addr.into(),
                         ));
                     }
                     Err(udp::RecvError::Exhausted) => {

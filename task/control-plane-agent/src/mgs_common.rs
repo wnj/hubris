@@ -3,10 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::{
+    Log, MgsMessage,
     dump::DumpState,
     inventory::Inventory,
-    update::{rot::RotUpdate, sp::SpUpdate, ComponentUpdater},
-    Log, MgsMessage,
+    update::{ComponentUpdater, rot::RotUpdate, sp::SpUpdate},
 };
 use drv_caboose::{CabooseError, CabooseReader};
 use drv_sprot_api::{
@@ -429,6 +429,31 @@ impl MgsCommon {
         }
     }
 
+    pub(crate) fn component_get_persistent_slot(
+        &mut self,
+        component: SpComponent,
+    ) -> Result<u16, GwSpError> {
+        match component {
+            SpComponent::SP_ITSELF => {
+                Ok(self.update_sp.get_pending_boot_slot().into())
+            }
+            SpComponent::ROT => {
+                let slot = match self
+                    .sprot
+                    .rot_boot_info()?
+                    .persistent_boot_preference
+                {
+                    SpSlotId::A => 0,
+                    SpSlotId::B => 1,
+                };
+                Ok(slot)
+            }
+            // We know that the LPC55S69 RoT bootloader does not have switchable banks.
+            SpComponent::STAGE0 => Ok(0),
+            _ => Err(GwSpError::RequestUnsupportedForComponent),
+        }
+    }
+
     pub(crate) fn read_sensor(
         &mut self,
         req: SensorRequest,
@@ -557,7 +582,7 @@ impl MgsCommon {
                         }
                         VpdError::AlreadyLocked => GwVpdError::AlreadyLocked,
                         VpdError::ServerRestarted => GwVpdError::TaskRestarted,
-                    }))
+                    }));
                 }
             }
         }

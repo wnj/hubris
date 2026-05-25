@@ -4,12 +4,16 @@ inherit = "base-gimletlet2.toml"
 [kernel]
 features = ["dump"]
 
+[caboose]
+tasks = ["packrat"]
+
 [tasks.hiffy]
 features = ["h753", "stm32h7", "i2c", "gpio", "qspi", "hash", "sprot"]
 task-slots = ["hash_driver", "hf", "i2c_driver", "sprot", "sys", "update_server", "user_leds"]
 
 [tasks.jefe]
-features = ["dump"]
+stacksize = 2296
+features = ["dump", "fault-notification"]
 extern-regions = ["sram1", "sram2", "sram3", "sram4"]
 
 [tasks.jefe.config.allowed-callers]
@@ -18,6 +22,9 @@ request_reset = ["hiffy", "control_plane_agent", "udprpc"]
 
 [tasks.jefe.config.on-state-change]
 host_sp_comms = "jefe-state-change"
+
+[tasks.jefe.config.on-task-fault]
+packrat = "task-faulted"
 
 [tasks.sys]
 # Enable EXTI in the sys task so that we can notify sprot when the RoT
@@ -44,10 +51,10 @@ owner = {name = "sprot", notification = "rot_irq"}
 name = "task-packrat"
 priority = 1
 start = true
-# task-slots is explicitly empty: packrat should not send IPCs!
-task-slots = []
-stacksize = 1040
+task-slots = ["jefe"]
+stacksize = 1400
 features = ["ereport"]
+notifications = ["task-faulted"]
 
 [tasks.control_plane_agent]
 name = "task-control-plane-agent"

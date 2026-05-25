@@ -2,6 +2,10 @@ name: build-boards.yml (reusable)
 on:
   workflow_call:
     inputs:
+      ref:
+        description: Commit to build
+        required: true
+        type: string
       os:
         description: OS to build for
         required: true
@@ -41,6 +45,8 @@ jobs:
     steps:
       - name: Checkout the source code
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Calculate the CI matrix
         # The $filter_directories bash variable is intentionally not quoted to allow for multiple
@@ -72,6 +78,8 @@ jobs:
     steps:
       - name: Checkout the source code
         uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Install Rust toolchain
         run: |
@@ -106,23 +114,23 @@ jobs:
           RUST_BACKTRACE: 1
 
       - name: Fetch Humility
-        uses: dsaltares/fetch-gh-release-asset@master
         if: runner.os == 'Linux'
-        with:
-          repo: "oxidecomputer/humility"
-          version: "59047694"
-          file: "humility"
-          target: "target/release/humility"
+        run: |
+          gh release download -R oxidecomputer/humility nightly -p humility -O target/release/humility
+          chmod +x target/release/humility
+        env:
+          # The oxidecomputer/humility repository is public, so *in theory* we don't need a token to
+          # download releases from it. In practice we occasionally saw downloading Humility failing
+          # with a 429 (too many requests) status code. To avoid that we use the `gh` CLI with the
+          # job's GitHub token to download, granting us higher rate limits.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Test Humility manifest
-        # we need to chmod because all artifacts are marked as non-executable
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev libftdi1-dev
-          sudo chmod +x target/release/humility
           for image in ${images}; do
-              mv "target/${name}/dist/${image}/build-${name}-image-${image}.zip" "target/${name}/dist/";
-              target/release/humility -a "target/${name}/dist/build-${name}-image-${image}.zip" manifest;
+              target/release/humility -a "target/${name}/dist/${image}/build-${name}-image-${image}.zip" manifest;
           done
         env:
           name: ${{ matrix.app_name }}
@@ -135,13 +143,25 @@ jobs:
 
       - name: Attestation
         uses: actions/attest-build-provenance@v1
+        id: attest
         if: inputs.attest
         with:
-          subject-path: target/${{ matrix.app_name }}/dist/build-${{ matrix.app_name }}-image-*.zip
+          subject-path: target/${{ matrix.app_name }}/dist/*/build-${{ matrix.app_name }}-image-*.zip
+          show-summary: false
+
+      - name: Prepare artifacts for upload
+        id: prepare-upload
+        if: inputs.upload-artifacts
+        run: |
+          path="$(cargo xtask gha-prepare-artifacts $APP_TOML $ATTESTATION)"
+          echo "path=$path" >> $GITHUB_OUTPUT
+        env:
+          APP_TOML: ${{ matrix.app_toml }}
+          ATTESTATION: ${{ inputs.attest && steps.attest.outputs.bundle-path || '' }}
 
       - name: Upload build archive
         uses: actions/upload-artifact@v4
         if: inputs.upload-artifacts
         with:
           name: dist-${{ inputs.os }}-${{ matrix.app_name }}
-          path: target/${{ matrix.app_name }}/dist/build-${{ matrix.app_name }}-image-*.zip
+          path: ${{ steps.prepare-upload.outputs.path }}

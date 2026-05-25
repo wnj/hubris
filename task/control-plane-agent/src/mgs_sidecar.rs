@@ -3,10 +3,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use crate::{
-    mgs_common::MgsCommon, update::rot::RotUpdate, update::sp::SpUpdate,
-    update::ComponentUpdater, usize_max, CriticalEvent, Log, MgsMessage,
+    CriticalEvent, Log, MgsMessage,
+    ignition_controller::{self, IgnitionController},
+    mgs_common::MgsCommon,
+    update::ComponentUpdater,
+    update::rot::RotUpdate,
+    update::sp::SpUpdate,
+    usize_max,
 };
-use drv_ignition_api::IgnitionError;
 use drv_monorail_api::{Monorail, MonorailError};
 use drv_sidecar_seq_api::Sequencer;
 use drv_transceivers_api::Transceivers;
@@ -15,15 +19,15 @@ use gateway_messages::sp_impl::{
     BoundsChecked, DeviceDescription, Sender, SpHandler,
 };
 use gateway_messages::{
-    ignition, ComponentAction, ComponentActionResponse, ComponentDetails,
+    ComponentAction, ComponentActionResponse, ComponentDetails,
     ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask,
     EcdsaSha2Nistp256Challenge, IgnitionCommand, IgnitionState, MgsError,
     MgsRequest, MgsResponse, MonorailComponentAction,
     MonorailComponentActionResponse, MonorailError as GwMonorailError,
-    PowerState, PowerStateTransition, RotBootInfo, RotRequest, RotResponse,
-    SensorRequest, SensorResponse, SpComponent, SpError, SpStateV2,
-    SpUpdatePrepare, UnlockChallenge, UnlockResponse, UpdateChunk, UpdateId,
-    UpdateStatus,
+    PcieRegisterRead, PowerState, PowerStateTransition, RotBootInfo,
+    RotRequest, RotResponse, SensorRequest, SensorResponse, SpComponent,
+    SpError, SpStateV2, SpUpdatePrepare, UnlockChallenge, UnlockResponse,
+    UpdateChunk, UpdateId, UpdateStatus, ignition,
 };
 use host_sp_messages::HostStartupOptions;
 use idol_runtime::{Leased, RequestError};
@@ -35,12 +39,8 @@ use zerocopy::IntoBytes;
 
 // We're included under a special `path` cfg from main.rs, which confuses rustc
 // about where our submodules live. Pass explicit paths to correct it.
-#[path = "mgs_sidecar/ignition.rs"]
-mod ignition_handler;
 #[path = "mgs_sidecar/monorail_port_status.rs"]
 mod monorail_port_status;
-
-use ignition_handler::IgnitionController;
 
 userlib::task_slot!(SIDECAR_SEQ, sequencer);
 userlib::task_slot!(MONORAIL, monorail);
@@ -190,12 +190,12 @@ impl MgsHandler {
 
         let now = sys_get_timer().now;
         for (vid, k) in self.locked.clone().iter() {
-            if let LockState::UnlockedUntil(lock_at) = k {
-                if now >= *lock_at {
-                    ringbuf_entry!(Trace::TimedRelock { vid });
-                    if let Err(e) = self.lock(vid) {
-                        ringbuf_entry!(Trace::TimedLockFailed(e));
-                    }
+            if let LockState::UnlockedUntil(lock_at) = k
+                && now >= *lock_at
+            {
+                ringbuf_entry!(Trace::TimedRelock { vid });
+                if let Err(e) = self.lock(vid) {
+                    ringbuf_entry!(Trace::TimedLockFailed(e));
                 }
             }
         }
@@ -466,9 +466,9 @@ fn verify_signature(
 }
 
 impl SpHandler for MgsHandler {
-    type BulkIgnitionStateIter = ignition_handler::BulkIgnitionStateIter;
+    type BulkIgnitionStateIter = ignition_controller::BulkIgnitionStateIter;
     type BulkIgnitionLinkEventsIter =
-        ignition_handler::BulkIgnitionLinkEventsIter;
+        ignition_controller::BulkIgnitionLinkEventsIter;
     type VLanId = VLanId;
 
     /// Checks whether we trust the given message
@@ -528,18 +528,14 @@ impl SpHandler for MgsHandler {
     }
 
     fn num_ignition_ports(&mut self) -> Result<u32, SpError> {
-        self.ignition
-            .num_ports()
-            .map_err(sp_error_from_ignition_error)
+        self.ignition.num_ports()
     }
 
     fn ignition_state(&mut self, target: u8) -> Result<IgnitionState, SpError> {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::IgnitionState {
             target
         }));
-        self.ignition
-            .target_state(target)
-            .map_err(sp_error_from_ignition_error)
+        self.ignition.target_state(target)
     }
 
     fn bulk_ignition_state(
@@ -549,9 +545,7 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::BulkIgnitionState {
             offset
         }));
-        self.ignition
-            .bulk_state(offset)
-            .map_err(sp_error_from_ignition_error)
+        self.ignition.bulk_state(offset)
     }
 
     fn ignition_link_events(
@@ -561,9 +555,7 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::IgnitionLinkEvents {
             target
         }));
-        self.ignition
-            .target_link_events(target)
-            .map_err(sp_error_from_ignition_error)
+        self.ignition.target_link_events(target)
     }
 
     fn bulk_ignition_link_events(
@@ -573,9 +565,7 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(
             MgsMessage::BulkIgnitionLinkEvents { offset }
         ));
-        self.ignition
-            .bulk_link_events(offset)
-            .map_err(sp_error_from_ignition_error)
+        self.ignition.bulk_link_events(offset)
     }
 
     fn clear_ignition_link_events(
@@ -586,9 +576,7 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(
             MgsMessage::ClearIgnitionLinkEvents
         ));
-        self.ignition
-            .clear_link_events(target, transceiver_select)
-            .map_err(sp_error_from_ignition_error)
+        self.ignition.clear_link_events(target, transceiver_select)
     }
 
     fn ignition_command(
@@ -600,9 +588,7 @@ impl SpHandler for MgsHandler {
             target,
             command
         }));
-        self.ignition
-            .command(target, command)
-            .map_err(sp_error_from_ignition_error)
+        self.ignition.command(target, command)
     }
 
     fn sp_state(&mut self) -> Result<SpStateV2, SpError> {
@@ -910,10 +896,15 @@ impl SpHandler for MgsHandler {
             component
         }));
 
-        match component {
-            SpComponent::MONORAIL => Ok(drv_monorail_api::PORT_COUNT as u32),
-            _ => self.common.inventory().num_component_details(&component),
-        }
+        self.common
+            .inventory()
+            .num_component_details(&component, |component| match *component {
+                SpComponent::MONORAIL => drv_monorail_api::PORT_COUNT as u32,
+                SpComponent::TOFINO => {
+                    drv_sidecar_seq_api::TOFINO_DEBUG_REGS.len() as u32
+                }
+                _ => 0,
+            })
     }
 
     /// When this method is called by `handle_message`, `index` has been bounds
@@ -931,9 +922,41 @@ impl SpHandler for MgsHandler {
             _ => self.common.inventory().component_details(
                 &component,
                 index,
-                // This should never be called, because num_component_details
-                // never returns > 0 for devices in the OUR_DEVICES array
-                |_, _| panic!("no custom devices"),
+                |dev, index| match dev.component {
+                    SpComponent::TOFINO => {
+                        let bounded = if (index.0 as usize)
+                            > drv_sidecar_seq_api::TOFINO_DEBUG_REGS.len()
+                        {
+                            panic!(
+                                "index out bounds; this should be unreachable"
+                            );
+                        } else {
+                            index.0 as usize
+                        };
+
+                        let result = self.sequencer.tofino_read_direct(
+                            drv_sidecar_seq_api::TOFINO_DEBUG_REGS[bounded].0,
+                            drv_sidecar_seq_api::TOFINO_DEBUG_REGS[bounded]
+                                .1
+                                .into(),
+                        );
+
+                        ComponentDetails::Pcie(PcieRegisterRead {
+                            bar: drv_sidecar_seq_api::TOFINO_DEBUG_REGS
+                                [bounded]
+                                .0
+                                .into(),
+                            offset: drv_sidecar_seq_api::TOFINO_DEBUG_REGS
+                                [bounded]
+                                .1
+                                .into(),
+                            reg_result: result.map_err(|e| e.into()),
+                        })
+                    }
+                    _ => {
+                        panic!("unknown component");
+                    }
+                },
             ),
         }
     }
@@ -965,6 +988,17 @@ impl SpHandler for MgsHandler {
 
         self.common
             .component_set_active_slot(component, slot, persist)
+    }
+
+    fn component_get_persistent_slot(
+        &mut self,
+        component: SpComponent,
+    ) -> Result<u16, SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::ComponentGetPersistentSlot { component }
+        ));
+
+        self.common.component_get_persistent_slot(component)
     }
 
     fn component_clear_status(
@@ -1194,22 +1228,6 @@ impl SpHandler for MgsHandler {
         }));
         Err(SpError::RequestUnsupportedForSp)
     }
-}
-
-// Helper function for `.map_err()`; we can't use `?` because we can't implement
-// `From<_>` between these types due to orphan rules.
-fn sp_error_from_ignition_error(err: IgnitionError) -> SpError {
-    use gateway_messages::ignition::IgnitionError as E;
-    let err = match err {
-        IgnitionError::FpgaError => E::FpgaError,
-        IgnitionError::InvalidPort => E::InvalidPort,
-        IgnitionError::InvalidValue => E::InvalidValue,
-        IgnitionError::NoTargetPresent => E::NoTargetPresent,
-        IgnitionError::RequestInProgress => E::RequestInProgress,
-        IgnitionError::RequestDiscarded => E::RequestDiscarded,
-        _ => E::Other(err as u32),
-    };
-    SpError::Ignition(err)
 }
 
 fn get_ecdsa_challenge() -> Result<EcdsaSha2Nistp256Challenge, SpError> {

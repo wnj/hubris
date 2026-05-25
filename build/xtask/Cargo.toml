@@ -1,7 +1,7 @@
 [package]
 name = "xtask"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -19,9 +19,11 @@ byteorder = { workspace = true }
 bzip2-rs = { workspace = true }
 capstone = { workspace = true }
 ctrlc = { workspace = true }
+directories = { workspace = true }
 dunce = { workspace = true }
 filetime = { workspace = true }
 fnv = { workspace = true }
+glob = { workspace = true }
 goblin = { workspace = true }
 hex = "0.4"
 hubtools = { workspace = true }
@@ -43,6 +45,10 @@ toml = { workspace = true }
 walkdir = { workspace = true }
 zerocopy = { workspace = true }
 zip = { workspace = true }
+
+# for gha-prepare-artifact
+base64 = { workspace = true }
+sha2 = { workspace = true }
 
 gnarle = { path = "../../lib/gnarle", features = ["std"] }
 abi.path = "../../sys/abi"

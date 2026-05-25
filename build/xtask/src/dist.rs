@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
@@ -12,18 +11,16 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use atty::Stream;
 use indexmap::IndexMap;
-use lpc55_rom_data::FLASH_PAGE_SIZE as LPC55_FLASH_PAGE_SIZE;
 use multimap::MultiMap;
 use path_slash::{PathBufExt, PathExt};
-use sha3::{Digest, Sha3_256};
 use zerocopy::IntoBytes;
 
 use crate::{
     caboose_pos,
-    config::{BuildConfig, CabooseConfig, Config},
+    config::{BuildConfig, CabooseConfig, Config, DEFAULT_RAM_NAME},
     elf,
     sizes::load_task_size,
     task_slot,
@@ -44,11 +41,16 @@ pub const DEFAULT_KERNEL_STACK: u32 = 1024;
 /// without breaking CI.
 ///
 /// # Changelog
-/// Version 10 requires Humility to be aware of the `handoff` kernel feature,
-/// which lets the RoT inform the SP when measurements have been taken.  If
-/// Humility is unaware of this feature, the SP will reset itself repeatedly,
-/// which interferes with subsequent programming of auxiliary flash.
-const HUBRIS_ARCHIVE_VERSION: u32 = 10;
+/// ## Version 11
+/// Adds a `pwm` sensor, which requires Humility to either accept that sensor
+/// kind or accept unrecognized sensors without bailing.
+///
+/// ## Version 10
+/// Requires Humility to be aware of the `handoff` kernel feature, which lets
+/// the RoT inform the SP when measurements have been taken.  If Humility is
+/// unaware of this feature, the SP will reset itself repeatedly, which
+/// interferes with subsequent programming of auxiliary flash.
+const HUBRIS_ARCHIVE_VERSION: u32 = 11;
 
 /// `PackageConfig` contains a bundle of data that's commonly used when
 /// building a full app image, grouped together to avoid passing a bunch
@@ -135,8 +137,10 @@ impl PackageConfig {
         let board_path =
             Path::new("boards").join(format!("{}.toml", toml.board));
         if !board_path.exists() {
-            bail!("Failed to find {:?}", board_path);
+            bail!("Failed to find {}", board_path.display());
         }
+
+        let remap_paths = Self::remap_paths(&sysroot, &toml.target)?;
 
         Ok(Self {
             app_src_dir: app_src_dir.to_path_buf(),
@@ -146,7 +150,7 @@ impl PackageConfig {
             dist_dir,
             sysroot,
             host_triple,
-            remap_paths: Self::remap_paths()?,
+            remap_paths,
             link_script_hash: extra_hash.finish(),
         })
     }
@@ -163,11 +167,19 @@ impl PackageConfig {
         self.dist_dir.join(name)
     }
 
-    fn remap_paths() -> Result<BTreeMap<PathBuf, &'static str>> {
+    fn remap_paths(
+        sysroot: &Path,
+        target: &str,
+    ) -> Result<BTreeMap<PathBuf, &'static str>> {
         // Panic messages in crates have a long prefix; we'll shorten it using
-        // the --remap-path-prefix argument to reduce message size.  We'll remap
-        // local (Hubris) crates to /hubris, crates.io to /crates.io, and git
-        // dependencies to /git
+        // the --remap-path-prefix argument to reduce message size.  This is
+        // good for both binary size and for reproducibility, since we don't
+        // want paths to people's home directories embedded in the binaries.
+        //
+        // We'll remap local (Hubris) crates to `/hubris`, crates.io to
+        // `/crates.io`, git dependencies to `/git`, and the sysroot
+        // (e.g. `~/.rustup/toolchains/nightly-yyyy-mm-dd-target-triple/`) to
+        // `toolchain`.
         let mut remap_paths = BTreeMap::new();
 
         // On Windows, std::fs::canonicalize returns a UNC path, i.e. one
@@ -201,11 +213,36 @@ impl PackageConfig {
             remap_paths.insert(cargo_sparse_registry, "/crates.io");
         }
 
+        remap_paths.insert(
+            sysroot
+                .to_path_buf()
+                .join("lib")
+                .join("rustlib")
+                .join("src")
+                .join("rust")
+                .join("library")
+                .join("core")
+                .join("src"),
+            "/rustlib",
+        );
+
         if let Ok(dir) = std::env::var("CARGO_MANIFEST_DIR") {
             let mut hubris_dir = dunce::canonicalize(dir)?;
             hubris_dir.pop();
             hubris_dir.pop();
             remap_paths.insert(hubris_dir.to_path_buf(), "/hubris");
+            // Shorten the build directories from
+            // `hubris/target/thumbv7em-none-eabihf/release/build` to just
+            // `hubris/build`
+            remap_paths.insert(
+                hubris_dir
+                    .to_path_buf()
+                    .join("target")
+                    .join(target)
+                    .join("release")
+                    .join("build"),
+                "/hubris/build",
+            );
         }
         Ok(remap_paths)
     }
@@ -328,14 +365,27 @@ mod checked_types {
 // Republish these types for widespread availability
 pub use checked_types::{ContiguousRanges, OrderedVecDeque};
 
+/// Container of named flags used when calling [`package`]
+#[derive(Copy, Clone, Debug)]
+pub struct PackageFlags {
+    pub verbose: bool,
+    pub edges: bool,
+    pub dirty_ok: bool,
+    pub skip_path_check: bool,
+}
+
 pub fn package(
-    verbose: bool,
-    edges: bool,
     app_toml: &Path,
+    flags: PackageFlags,
     tasks_to_build: Option<Vec<String>>,
-    dirty_ok: bool,
     caboose_args: super::CabooseArgs,
 ) -> Result<BTreeMap<String, AllocationMap>> {
+    let PackageFlags {
+        verbose,
+        edges,
+        dirty_ok,
+        skip_path_check,
+    } = flags;
     let cfg = PackageConfig::new(app_toml, verbose, edges)?;
 
     // Verify that our dump configuration is correct (or absent)
@@ -385,13 +435,14 @@ pub fn package(
         .tasks
         .keys()
         .map(|name| {
+            let ram_region = cfg.toml.task_ram_region(name);
             let size = if tasks_to_build.contains(name.as_str()) {
                 link_dummy_task(&cfg, name, &cfg.toml.image_names[0])?;
                 task_size(&cfg, name)
             } else {
                 // Dummy allocations
                 let out: IndexMap<_, _> =
-                    [("flash", 64), ("ram", 64)].into_iter().collect();
+                    [("flash", 64), (ram_region, 64)].into_iter().collect();
                 Ok(out)
             };
             size.map(|sz| (name.as_str(), sz))
@@ -454,11 +505,14 @@ pub fn package(
         // Same check for the kernel.  This may be overly conservative, because
         // the kernel is special, but we can always make it less strict later.
         for r in &cfg.toml.kernel.extern_regions {
-            if let Some(v) = alloc_regions.get(r) {
+            if let Some(v) = alloc_regions.get(&r.region)
+                && !r.shared
+            {
                 bail!(
-                    "cannot use region '{r}' as extern region in \
-                    the kernel because it's used as a normal region by \
-                    [{}]",
+                    "cannot use region '{}' as extern region in \
+                        the kernel because it's used as a normal region by \
+                        [{}] and not shared",
+                    r.region,
                     v.join(", ")
                 );
             }
@@ -499,6 +553,21 @@ pub fn package(
             if tasks_to_build.contains(task_name.as_str()) {
                 if task_can_overflow(&cfg.toml, task_name, verbose)? {
                     possible_stack_overflow.push(task_name);
+                }
+                if task_contains_home(&cfg.toml, task_name)? {
+                    if skip_path_check {
+                        eprintln!(
+                            "warning: task {task_name} contains your home \
+                             directory; the build is probably not reproducible!"
+                        );
+                    } else {
+                        bail!(
+                            "task {task_name} contains your home directory; \
+                             the build is probably not reproducible!\n\
+                             Use `--dangerously-skip-path-check` to disable \
+                             this check"
+                        );
+                    }
                 }
 
                 resolve_task_slots(&cfg, task_name, image_name)?;
@@ -604,13 +673,26 @@ pub fn package(
         let starting_memories = cfg.toml.memories(image_name)?;
         for (name, range) in &starting_memories {
             println!(
-                "{:<7} = {:#010x}..{:#010x}",
+                "{:<9} = {:#010x}..{:#010x}",
                 name, range.start, range.end
             );
         }
         println!("Used:");
+        let mut printed_ram_note = false;
         for (name, new_range) in memories {
-            print!("  {:<8} ", format!("{name}:"));
+            print!(
+                "  {:<10} ",
+                format!(
+                    "{name}{}:",
+                    if name == &cfg.toml.default_ram && name != DEFAULT_RAM_NAME
+                    {
+                        printed_ram_note = true;
+                        "*"
+                    } else {
+                        ""
+                    }
+                )
+            );
 
             if let Some(tasks) = extern_regions.get_vec(name) {
                 println!("extern region ({})", tasks.join(", "));
@@ -621,6 +703,9 @@ pub fn package(
 
                 println!("{size:#x} ({percent}%)");
             }
+        }
+        if printed_ram_note {
+            println!("    *default ram region");
         }
 
         // Generate a RawHubrisImage, which is our source of truth for combined
@@ -720,10 +805,6 @@ pub fn package(
             archive.overwrite()?;
         }
 
-        if cfg.toml.fwid {
-            write_fwid(&cfg, image_name, &flash, &archive_name)?;
-        }
-
         // Unzip the signed + caboose'd images into our build directory
         let archive = hubtools::RawHubrisArchive::load(&archive_name)
             .context("loading archive with hubtools")?;
@@ -736,67 +817,6 @@ pub fn package(
         }
     }
     Ok(allocated)
-}
-
-// generate file with hash of expected flash contents
-fn write_fwid(
-    cfg: &PackageConfig,
-    image_name: &str,
-    flash: &Range<u32>,
-    archive_name: &PathBuf,
-) -> Result<()> {
-    let mut archive = hubtools::RawHubrisArchive::load(archive_name)
-        .context("loading archive with hubtools")?;
-
-    let bin = archive
-        .extract_file("img/final.bin")
-        .context("extracting final.bin after signing & caboosing")?;
-
-    let chip_name = Path::new(&cfg.toml.chip);
-
-    // determine length of padding
-    let pad = match chip_name.file_name().and_then(OsStr::to_str) {
-        Some("lpc55") => {
-            // Flash is programmed in 512 blocks. If the final block is not
-            // filled, it is padded with 0xff's. Unwritten flash pages cannot
-            // be read and are not included in the FWID calculation.
-            LPC55_FLASH_PAGE_SIZE - bin.len() % LPC55_FLASH_PAGE_SIZE
-        }
-        Some("stm32h7") => {
-            // all unprogrammed flash is read as 0xff
-            flash.end as usize - flash.start as usize - bin.len()
-        }
-        Some(c) => {
-            bail!("no FWID algorithm defined for chip: \"{}\"", c)
-        }
-        None => bail!("Failed to get file name of {}", chip_name.display()),
-    };
-
-    let mut sha = Sha3_256::new();
-    sha.update(&bin);
-
-    if pad != 0 {
-        sha.update(vec![0xff_u8; pad])
-    }
-
-    let digest = sha.finalize();
-
-    // after we've appended a newline fwid is immutable
-    let mut fwid = hex::encode(digest);
-    writeln!(fwid).context("appending newline to FWID")?;
-    let fwid = fwid;
-
-    // the archive already exists so we write the FWID to the same path in
-    // the build output and archive to keep the two consistent
-    fs::write(cfg.img_file("final.fwid", image_name), &fwid)
-        .context("writing FWID to build output")?;
-    archive
-        .add_file("img/final.fwid", fwid.as_bytes())
-        .context("writing FWID to archive")?;
-
-    archive.overwrite()?;
-
-    Ok(())
 }
 
 fn write_gdb_script(cfg: &PackageConfig, image_name: &str) -> Result<()> {
@@ -820,7 +840,9 @@ fn write_gdb_script(cfg: &PackageConfig, image_name: &str) -> Result<()> {
     for (path, remap) in &cfg.remap_paths {
         let mut path_str = path
             .to_str()
-            .ok_or_else(|| anyhow!("Could not convert path{:?} to str", path))?
+            .ok_or_else(|| {
+                anyhow!("Could not convert path {} to str", path.display())
+            })?
             .to_string();
 
         // Even on Windows, GDB expects path components to be separated by '/',
@@ -986,14 +1008,20 @@ fn build_archive(
                         let dir = pkg.manifest_path.parent().unwrap();
 
                         let f = dir.join(s);
-                        let task_dir = PathBuf::from("task").join(name).join(s);
-                        archive.copy(f, task_dir).with_context(|| {
-                            format!(
-                                "task {name}: failed to copy \"{s}\" in {} \
-                                into the archive",
-                                dir.display()
-                            )
-                        })?;
+                        let task_dir = PathBuf::from("task").join(name);
+                        for f in glob::glob(f.to_str().unwrap())? {
+                            let f = f?;
+                            let task_file = f.strip_prefix(dir)?;
+                            archive
+                                .copy(&f, task_dir.join(task_file))
+                                .with_context(|| {
+                                    format!(
+                                    "task {name}: failed to copy \"{s}\" in {} \
+                                    into the archive",
+                                    dir.display()
+                                )
+                                })?;
+                        }
                     }
                     Some(_) => {
                         bail!(
@@ -1113,6 +1141,25 @@ fn build_task(cfg: &PackageConfig, name: &str) -> Result<()> {
         .context(format!("failed to build {name}"))
 }
 
+/// Returns `Ok(true)` if the given task contains the user's home directory
+///
+/// This is useful for making sure builds are reproducible.
+fn task_contains_home(toml: &Config, task_name: &str) -> Result<bool> {
+    // Open the statically-linked ELF file
+    let f = Path::new("target")
+        .join(&toml.name)
+        .join("dist")
+        .join(format!("{task_name}.tmp"));
+    let data = std::fs::read(f).context("could not open ELF file")?;
+    let dirs = directories::BaseDirs::new()
+        .ok_or_else(|| anyhow!("could not get base directories"))?;
+    let home_dir = dirs.home_dir();
+    Ok(
+        memchr::memmem::find(&data, home_dir.as_os_str().as_encoded_bytes())
+            .is_some(),
+    )
+}
+
 /// Checks whether the given task can overflow its stack
 ///
 /// False negatives are possible if the deepest posssible stack uses dynamic
@@ -1226,8 +1273,8 @@ pub fn get_max_stack(
         .context("could not get .text")?;
 
     use capstone::{
-        arch::{arm, ArchOperand, BuildsCapstone, BuildsCapstoneExtraMode},
         Capstone, InsnGroupId, InsnGroupType,
+        arch::{ArchOperand, BuildsCapstone, BuildsCapstoneExtraMode, arm},
     };
     let cs = Capstone::new()
         .arm()
@@ -1430,8 +1477,9 @@ fn link_task(
         "memory.x",
         &allocs.tasks[name],
         Some(&task_toml.sections),
+        cfg.toml.task_ram_region(name),
         task_toml.stacksize.or(cfg.toml.stacksize).ok_or_else(|| {
-            anyhow!("{}: no stack size specified and there is no default", name)
+            anyhow!("{name}: no stack size specified and there is no default")
         })?,
         &cfg.toml.all_regions("flash".to_string())?,
         &extern_regions,
@@ -1465,8 +1513,9 @@ fn link_dummy_task(
         "memory.x",
         &memories, // ALL THE SPACE
         Some(&task_toml.sections),
+        cfg.toml.task_ram_region(name),
         task_toml.stacksize.or(cfg.toml.stacksize).ok_or_else(|| {
-            anyhow!("{}: no stack size specified and there is no default", name)
+            anyhow!("{name}: no stack size specified and there is no default")
         })?,
         &cfg.toml.all_regions("flash".to_string())?,
         &extern_regions,
@@ -1511,15 +1560,15 @@ fn load_task_flash(
         all_output_sections,
         &mut symbol_table,
     )?;
-    if let Some(required) = task_toml.max_sizes.get("flash") {
-        if flash > *required as usize {
-            bail!(
-                "{} has insufficient flash: specified {} bytes, needs {}",
-                task_toml.name,
-                required,
-                flash
-            );
-        }
+    if let Some(required) = task_toml.max_sizes.get("flash")
+        && flash > *required as usize
+    {
+        bail!(
+            "{} has insufficient flash: specified {} bytes, needs {}",
+            task_toml.name,
+            required,
+            flash
+        );
     }
     Ok(())
 }
@@ -1547,6 +1596,7 @@ fn build_kernel(
     generate_kernel_linker_script(
         "memory.x",
         &allocs.kernel,
+        cfg.toml.kernel_ram_region(),
         cfg.toml.kernel.stacksize.unwrap_or(DEFAULT_KERNEL_STACK),
         &cfg.toml.all_regions("flash".to_string())?,
         &extern_regions,
@@ -1627,44 +1677,41 @@ fn update_image_header(
 
     // Good enough.
     for sec in &elf.section_headers {
-        if let Some(name) = elf.shdr_strtab.get_at(sec.sh_name) {
-            if name == ".header"
-                && (sec.sh_size as usize)
-                    >= core::mem::size_of::<abi::ImageHeader>()
-            {
-                let flash = map.get("flash").unwrap();
+        if let Some(name) = elf.shdr_strtab.get_at(sec.sh_name)
+            && name == ".header"
+            && (sec.sh_size as usize)
+                >= core::mem::size_of::<abi::ImageHeader>()
+        {
+            let flash = map.get("flash").unwrap();
 
-                // Compute the total image size by finding the highest address
-                // from all the tasks built.
-                let end = all_output_sections
-                    .iter()
-                    .filter(|(addr, _sec)| flash.contains(addr))
-                    .map(|(&addr, sec)| addr + sec.data.len() as u32)
-                    .max();
-                // Normally, at this point, all tasks are built, so we can
-                // compute the actual number. However, in the specific case of
-                // `xtask build kernel`, we need a result from this calculation
-                // but `end` will be `None`. Substitute a placeholder:
-                let end = end.unwrap_or(flash.start);
+            // Compute the total image size by finding the highest address
+            // from all the tasks built.
+            let end = all_output_sections
+                .iter()
+                .filter(|(addr, _sec)| flash.contains(addr))
+                .map(|(&addr, sec)| addr + sec.data.len() as u32)
+                .max();
+            // Normally, at this point, all tasks are built, so we can
+            // compute the actual number. However, in the specific case of
+            // `xtask build kernel`, we need a result from this calculation
+            // but `end` will be `None`. Substitute a placeholder:
+            let end = end.unwrap_or(flash.start);
 
-                let len = end - flash.start;
+            let len = end - flash.start;
 
-                let header = abi::ImageHeader {
-                    version: cfg.toml.version,
-                    epoch: cfg.toml.epoch,
-                    magic: abi::HEADER_MAGIC,
-                    total_image_len: len,
-                    ..Default::default()
-                };
+            let header = abi::ImageHeader {
+                version: cfg.toml.version,
+                epoch: cfg.toml.epoch,
+                magic: abi::HEADER_MAGIC,
+                total_image_len: len,
+                ..Default::default()
+            };
 
-                header
-                    .write_to_prefix(
-                        &mut file_image[(sec.sh_offset as usize)..],
-                    )
-                    .unwrap();
-                std::fs::write(output, &file_image)?;
-                return Ok(true);
-            }
+            header
+                .write_to_prefix(&mut file_image[(sec.sh_offset as usize)..])
+                .unwrap();
+            std::fs::write(output, &file_image)?;
+            return Ok(true);
         }
     }
 
@@ -1745,7 +1792,7 @@ fn check_task_priorities(toml: &Config) -> Result<()> {
             let p = toml
                 .tasks
                 .get(callee)
-                .ok_or_else(|| anyhow!("Invalid task-slot: {}", callee))?
+                .ok_or_else(|| anyhow!("Invalid task-slot: {callee}"))?
                 .priority;
             if p >= task.priority && name != callee {
                 bail!(
@@ -1761,11 +1808,11 @@ fn check_task_priorities(toml: &Config) -> Result<()> {
             }
         }
         if task.priority >= idle_priority && name != "idle" {
-            bail!("task {} has priority that's >= idle priority", name);
+            bail!("task {name} has priority that's >= idle priority");
         } else if i == 0 && task.priority != 0 {
-            bail!("Supervisor task ({}) is not at priority 0", name);
+            bail!("Supervisor task ({name}) is not at priority 0");
         } else if i != 0 && task.priority == 0 {
-            bail!("Task {} is not the supervisor, but has priority 0", name,);
+            bail!("Task {name} is not the supervisor, but has priority 0");
         }
     }
 
@@ -1776,6 +1823,7 @@ fn generate_task_linker_script(
     name: &str,
     map: &BTreeMap<String, ContiguousRanges>,
     sections: Option<&IndexMap<String, String>>,
+    ram_section: &str,
     stacksize: u32,
     images: &IndexMap<String, Range<u32>>,
     extern_regions: &IndexMap<String, Range<u32>>,
@@ -1796,10 +1844,10 @@ fn generate_task_linker_script(
     for (name, ranges) in map {
         let mut start = ranges.start();
         let end = ranges.end();
-        let name = name.to_ascii_uppercase();
+        let name_upper = name.to_ascii_uppercase();
 
         // Our stack comes out of RAM
-        if name == "RAM" {
+        if name == ram_section {
             if stacksize & 0x7 != 0 {
                 // If we are not 8-byte aligned, the kernel will not be
                 // pleased -- and can't be blamed for a little rudeness;
@@ -1815,9 +1863,16 @@ fn generate_task_linker_script(
             }
         }
 
-        emit(&mut linkscr, &name, start, end - start)?;
+        emit(&mut linkscr, &name_upper, start, end - start)?;
     }
     writeln!(linkscr, "}}")?;
+    if !ram_section.eq_ignore_ascii_case("ram") {
+        writeln!(
+            linkscr,
+            "REGION_ALIAS(\"RAM\", {});",
+            ram_section.to_ascii_uppercase()
+        )?;
+    }
     append_image_names(&mut linkscr, images, image_name)?;
     append_extern_regions(&mut linkscr, extern_regions)?;
     append_task_sections(&mut linkscr, sections)?;
@@ -1894,6 +1949,7 @@ fn append_task_sections(
 fn generate_kernel_linker_script(
     name: &str,
     map: &BTreeMap<String, Range<u32>>,
+    ram_section: &str,
     stacksize: u32,
     images: &IndexMap<String, Range<u32>>,
     extern_regions: &IndexMap<String, Range<u32>>,
@@ -1910,10 +1966,10 @@ fn generate_kernel_linker_script(
     for (name, range) in map {
         let mut start = range.start;
         let end = range.end;
-        let name = name.to_ascii_uppercase();
+        let name_upper = name.to_ascii_uppercase();
 
         // Our stack comes out of RAM
-        if name == "RAM" {
+        if name == ram_section {
             if stacksize & 0x7 != 0 {
                 // If we are not 8-byte aligned, the kernel will not be
                 // pleased -- and can't be blamed for a little rudeness;
@@ -1937,13 +1993,20 @@ fn generate_kernel_linker_script(
         writeln!(
             linkscr,
             "{} (rwx) : ORIGIN = {:#010x}, LENGTH = {:#010x}",
-            name,
+            name_upper,
             start,
             end - start
         )
         .unwrap();
     }
     writeln!(linkscr, "}}").unwrap();
+    if !ram_section.eq_ignore_ascii_case("ram") {
+        writeln!(
+            linkscr,
+            "REGION_ALIAS(\"RAM\", {});",
+            ram_section.to_ascii_uppercase()
+        )?;
+    }
     writeln!(linkscr, "__eheap = ORIGIN(RAM) + LENGTH(RAM);").unwrap();
     writeln!(linkscr, "_stack_base = {:#010x};", stack_base.unwrap()).unwrap();
     writeln!(linkscr, "_stack_start = {:#010x};", stack_start.unwrap())
@@ -1969,7 +2032,7 @@ fn generate_kernel_linker_script(
 fn build(
     cfg: &PackageConfig,
     name: &str,
-    build_config: BuildConfig,
+    build_config: BuildConfig<'_>,
     reloc: bool,
 ) -> Result<()> {
     println!("building crate {}", build_config.crate_name);
@@ -2005,6 +2068,7 @@ fn build(
              -C link-arg=-z -C link-arg=max-page-size=0x20 \
              -C llvm-args=--enable-machine-outliner=never \
              -Z emit-stack-sizes \
+             -Z macro-backtrace \
              -C overflow-checks=y \
              -C metadata={} \
              {}
@@ -2302,7 +2366,7 @@ pub struct TaskRequest<'a> {
 /// requests per alignment size.
 pub fn allocate_all(
     toml: &Config,
-    task_sizes: &HashMap<&str, TaskRequest>,
+    task_sizes: &HashMap<&str, TaskRequest<'_>>,
     caboose: Option<&CabooseConfig>,
 ) -> Result<BTreeMap<String, AllocationMap>> {
     // Collect all allocation requests into queues, one per memory type, indexed
@@ -2331,11 +2395,17 @@ pub fn allocate_all(
 
         for name in tasks.keys() {
             let req = &task_sizes[name.as_str()];
+            // We evenly divide spare regions between RAM and flash, rounding up
+            // to give flash the extra (if there's an odd number).  This isn't a
+            // particularly fancy heuristic, but works fine for our images.
+            let flash_bonus = req.spare_regions.div_ceil(2);
+            let ram_bonus = req.spare_regions - flash_bonus;
+            let ram_region = toml.task_ram_region(name);
             for (&mem, &amt) in req.memory.iter() {
-                // Right now, flash is most limited, so it gets to use all of
-                // our spare regions (if present)
                 let n = if mem == "flash" {
-                    req.spare_regions + 1
+                    flash_bonus + 1
+                } else if mem == ram_region {
+                    ram_bonus + 1
                 } else {
                     1
                 };
@@ -2344,8 +2414,9 @@ pub fn allocate_all(
                     let total_bytes = bytes.iter().sum::<u64>();
                     if total_bytes > u64::from(*r) {
                         bail!(
-                        "task {}: needs {} bytes of {} but max-sizes limits it to {}",
-                        name, total_bytes, mem, r);
+                            "task {name}: needs {total_bytes} bytes of {mem} \
+                             but max-sizes limits it to {r}",
+                        );
                     }
                 }
                 // Convert from u64 -> u32
@@ -2596,12 +2667,7 @@ fn allocate_k(
     let base = (avail.start + 15) & !15;
 
     if !avail.contains(&(base + size - 1)) {
-        bail!(
-            "out of {}: can't allocate {} more after base {:x}",
-            region,
-            size,
-            base
-        )
+        bail!("out of {region}: can't allocate {size} more after base {base:x}")
     }
 
     let end = base + size;
@@ -2626,12 +2692,7 @@ fn allocate_one(
     let base = (avail.start + size_mask) & !size_mask;
 
     if base >= avail.end || size > avail.end - base {
-        bail!(
-            "out of {}: can't allocate {} more after base {:x}",
-            region,
-            size,
-            base
-        )
+        bail!("out of {region}: can't allocate {size} more after base {base:x}")
     }
 
     let end = base + size;
@@ -2745,11 +2806,11 @@ pub fn make_kconfig(
             task.uses.iter().cloned().collect();
 
         // Allow specified tasks to use the caboose
-        if let Some(caboose) = &toml.caboose {
-            if caboose.tasks.contains(name) {
-                used_shared_regions.insert("caboose");
-                shared_regions.insert("caboose".to_owned());
-            }
+        if let Some(caboose) = &toml.caboose
+            && caboose.tasks.contains(name)
+        {
+            used_shared_regions.insert("caboose");
+            shared_regions.insert("caboose".to_owned());
         }
 
         let extern_regions = toml.extern_regions_for(name, image_name)?;
@@ -2795,6 +2856,7 @@ pub fn make_kconfig(
                 .push(size);
         }
 
+        let ram_region = toml.task_ram_region(name);
         tasks.push(build_kconfig::TaskConfig {
             owned_regions,
             shared_regions,
@@ -2803,7 +2865,7 @@ pub fn make_kconfig(
                 offset: entry_offset,
             },
             initial_stack: build_kconfig::OwnedAddress {
-                region_name: "ram".to_string(),
+                region_name: ram_region.to_string(),
                 offset: stacksize,
             },
             priority: task.priority,
@@ -2823,30 +2885,21 @@ pub fn make_kconfig(
                     let periph =
                         toml.peripherals.get(pname).ok_or_else(|| {
                             anyhow!(
-                                "task {} IRQ {} references peripheral {}, \
-                                 which does not exist.",
-                                name,
-                                irq_str,
-                                pname,
+                                "task {name} IRQ {irq_str} references \
+                                 peripheral {pname}, which does not exist.",
                             )
                         })?;
                     periph.interrupts.get(iname).ok_or_else(|| {
                         anyhow!(
-                            "task {} IRQ {} references interrupt {} \
-                             on peripheral {}, but that interrupt name \
-                             not defined for that peripheral.",
-                            name,
-                            irq_str,
-                            iname,
-                            pname,
+                            "task {name} IRQ {irq_str} references \
+                             interrupt {iname} on peripheral {pname}, but that \
+                             interrupt name not defined for that peripheral."
                         )
                     }).cloned()?
                 } else {
                     bail!(
-                        "task {}: IRQ name {} does not match any \
+                        "task {name}: IRQ name {irq_str} does not match any \
                          known peripheral interrupt.",
-                        name,
-                        irq_str,
                     );
                 };
 
@@ -3145,16 +3198,19 @@ fn resolve_task_slots(
             ),
         };
 
-        let target_task_idx =
-            match cfg.toml.tasks.get_index_of(target_task_name) {
-                Some(x) => x,
-                _ => bail!(
-                    "app.toml sets task '{}' task_slot '{}' to task '{}', but no such task exists in the app.toml",
-                    task_name,
-                    entry.slot_name,
-                    target_task_name
-                ),
-            };
+        let target_task_idx = match cfg
+            .toml
+            .tasks
+            .get_index_of(target_task_name)
+        {
+            Some(x) => x,
+            _ => bail!(
+                "app.toml sets task '{}' task_slot '{}' to task '{}', but no such task exists in the app.toml",
+                task_name,
+                entry.slot_name,
+                target_task_name
+            ),
+        };
 
         out_task_bin.pwrite_with::<u16>(
             target_task_idx as u16,

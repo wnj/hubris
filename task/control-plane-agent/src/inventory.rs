@@ -11,7 +11,7 @@ use gateway_messages::{
 };
 use task_sensor_api::Sensor as SensorTask;
 use task_sensor_api::SensorError;
-use task_validate_api::{Sensor, DEVICES as VALIDATE_DEVICES};
+use task_validate_api::{DEVICES as VALIDATE_DEVICES, Sensor};
 use task_validate_api::{Validate, ValidateError, ValidateOk};
 use userlib::UnwrapLite;
 
@@ -37,19 +37,17 @@ impl Inventory {
         OUR_DEVICES.len() + VALIDATE_DEVICES.len()
     }
 
-    pub(crate) fn num_component_details(
+    pub(crate) fn num_component_details<F>(
         &self,
         component: &SpComponent,
-    ) -> Result<u32, SpError> {
+        our_device_lookup: F,
+    ) -> Result<u32, SpError>
+    where
+        F: Fn(&SpComponent) -> u32,
+    {
         match Index::try_from(component)? {
             Index::OurDevice(d) => {
-                match OUR_DEVICES[d].component {
-                    // The SP5 CPU can report a POST code
-                    SpComponent::SP5_HOST_CPU => Ok(1),
-                    // The SP3 CPU can report GPIO toggle counts
-                    SpComponent::SP3_HOST_CPU => Ok(1),
-                    _ => Ok(0),
-                }
+                Ok(our_device_lookup(&OUR_DEVICES[d].component))
             }
             Index::ValidateDevice(i) => {
                 Ok(VALIDATE_DEVICES[i].sensors.len() as u32)
@@ -74,7 +72,7 @@ impl Inventory {
         let val_device_index = match Index::try_from(component) {
             Ok(Index::ValidateDevice(i)) => i,
             Ok(Index::OurDevice(i)) => {
-                return our_device_lookup(&OUR_DEVICES[i], component_index)
+                return our_device_lookup(&OUR_DEVICES[i], component_index);
             }
             Err(_) => panic!(),
         };
@@ -257,6 +255,14 @@ mod devices_with_static_validation {
             capabilities: DeviceCapabilities::HAS_SERIAL_CONSOLE,
             presence: DevicePresence::Present, // TODO: ok to assume always present?
         },
+        #[cfg(feature = "cosmo")]
+        DeviceDescription {
+            component: SpComponent::SP5_POST_CODES,
+            device: SpComponent::SP5_POST_CODES.const_as_str(),
+            description: "Cosmo SP5 POST code buffer",
+            capabilities: DeviceCapabilities::empty(),
+            presence: DevicePresence::Present, // FPGA is soldered to the board
+        },
         // If we're building for gimlet, we always claim to have host boot flash.
         //
         // This is a lie on gimletlet (where we still build with the "gimlet"
@@ -273,6 +279,14 @@ mod devices_with_static_validation {
             description: "Cosmo host boot flash",
             capabilities: DeviceCapabilities::UPDATEABLE,
             presence: DevicePresence::Present, // TODO: ok to assume always present?
+        },
+        #[cfg(feature = "cosmo")]
+        DeviceDescription {
+            component: SpComponent::HOST_CPU_BOOT_APOB,
+            device: SpComponent::HOST_CPU_BOOT_APOB.const_as_str(),
+            description: "Cosmo host boot APOB region",
+            capabilities: DeviceCapabilities::empty(),
+            presence: DevicePresence::Present, // matches HOST_CPU_BOOT_FLASH
         },
         // If we're building for sidecar, we always claim to have a monorail.
         #[cfg(feature = "sidecar")]
@@ -299,6 +313,14 @@ mod devices_with_static_validation {
             // The LED is soldered to the board
             presence: DevicePresence::Present,
         },
+        #[cfg(feature = "sidecar")]
+        DeviceDescription {
+            component: SpComponent::TOFINO,
+            device: SpComponent::TOFINO.const_as_str(),
+            description: "Tofino",
+            capabilities: DeviceCapabilities::empty(),
+            presence: DevicePresence::Present,
+        },
     ];
 
     pub(super) static OUR_DEVICES: &[DeviceDescription<'static>] =
@@ -317,7 +339,7 @@ mod devices_with_static_validation {
         device: &'static str,
         description: &'static str,
     ) {
-        use gateway_messages::{tlv, SerializedSize, MIN_TRAILING_DATA_LEN};
+        use gateway_messages::{MIN_TRAILING_DATA_LEN, SerializedSize, tlv};
 
         let encoded_len = tlv::tlv_len(
             gateway_messages::DeviceDescriptionHeader::MAX_SIZE
