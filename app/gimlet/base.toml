@@ -125,7 +125,7 @@ notifications = ["i2c1-irq", "jefe-state-change"]
 [tasks.packrat]
 name = "task-packrat"
 priority = 1
-stacksize = 1400
+stacksize = 1616
 start = true
 task-slots = ["jefe"]
 features = ["gimlet", "ereport"]
@@ -166,7 +166,7 @@ name = "drv-gimlet-seq-server"
 features = ["h753"]
 priority = 4
 max-sizes = {flash = 131072, ram = 16384 }
-stacksize = 2600
+stacksize = 2792
 start = true
 task-slots = ["sys", "i2c_driver", {spi_driver = "spi2_driver"}, "hf", "jefe", "packrat"]
 notifications = ["timer", "vcore"]
@@ -199,7 +199,7 @@ task-slots = ["sys"]
 notifications = ["hash-irq"]
 
 [tasks.rng_driver]
-features = ["h753", "ereport"]
+features = ["h753", "packrat"]
 name = "drv-stm32h7-rng"
 priority = 6
 uses = ["rng"]
@@ -243,8 +243,8 @@ features = ["stm32h753", "uart7", "baud_rate_3M", "hardware_flow_control", "vlan
 uses = ["uart7", "dbgmcu"]
 interrupts = {"uart7.irq" = "usart-irq"}
 priority = 8
-max-sizes = {flash = 70000, ram = 65536}
-stacksize = 5376
+max-sizes = {flash = 75000, ram = 65536}
+stacksize = 7312
 start = true
 task-slots = ["sys", { cpu_seq = "gimlet_seq" }, "hf", "control_plane_agent", "net", "packrat", "i2c_driver", { spi_driver = "spi2_driver" }, "sprot"]
 notifications = ["jefe-state-change", "usart-irq", "multitimer", "control-plane-agent"]
@@ -465,6 +465,9 @@ address = 0x70
 device = "pca9545"
 description = "U.2 ABCD mux"
 refdes = "U336"
+# TODO Audit i2c devices using validate-with-raw-read.
+# https://github.com/oxidecomputer/hubris/issues/2629
+validate-with-raw-read = true
 
 [[config.i2c.devices]]
 bus = "front"
@@ -472,6 +475,9 @@ address = 0x71
 device = "pca9545"
 description = "U.2 EFGH mux"
 refdes = "U339"
+# TODO Audit i2c devices using validate-with-raw-read.
+# https://github.com/oxidecomputer/hubris/issues/2629
+validate-with-raw-read = true
 
 [[config.i2c.devices]]
 bus = "front"
@@ -479,6 +485,9 @@ address = 0x72
 device = "pca9545"
 description = "U.2 IJ/FRUID mux"
 refdes = "U337"
+# TODO Audit i2c devices using validate-with-raw-read.
+# https://github.com/oxidecomputer/hubris/issues/2629
+validate-with-raw-read = true
 
 ################################################################################
 # Sharkfins
@@ -867,6 +876,9 @@ address = 0x73
 device = "pca9545"
 description = "M.2 mux"
 refdes = "U422"
+# TODO Audit i2c devices using validate-with-raw-read.
+# https://github.com/oxidecomputer/hubris/issues/2629
+validate-with-raw-read = true
 
 [[config.i2c.devices]]
 bus = "m2"
@@ -874,6 +886,7 @@ mux = 1
 segment = 3
 address = 0b1010_000
 device = "at24csw080"
+eeprom-vpd = "sled-fan-tray"
 description = "Fan VPD"
 refdes = ["J180", "U1"]
 name = "fan_vpd"
@@ -963,6 +976,9 @@ address = 0x58
 device = "idt8a34003"
 description = "Clock generator"
 refdes = "U446"
+# TODO Audit i2c devices using validate-with-raw-read.
+# https://github.com/oxidecomputer/hubris/issues/2629
+validate-with-raw-read = true
 
 [[config.i2c.devices]]
 bus = "mid"
@@ -991,7 +1007,7 @@ device = "isl68224"
 description = "DIMM/SP3 1.8V A0 power controller"
 power.rails = [ "VPP_ABCD", "VPP_EFGH", "V1P8_SP3" ]
 power.phases = [ [ 0 ], [ 1 ], [ 2 ] ]
-sensors = { voltage = 3, current = 3 }
+sensors = { temperature = 3, voltage = 3, current = 3 }
 refdes = "U352"
 
 [[config.i2c.devices]]
@@ -1241,6 +1257,12 @@ name = "fan_ctrl"
 device = "thermal_loop"
 description = "Thermal loop"
 sensors.pwm = 1
+# XXX(eliza) arguably, we could also use the refdes of the actual fan controller
+# IC here, but we're treating the PWM percentage more as a synthetic property
+# determined by Hubris...and on some boards (such as Sidecar) there are multiple
+# fan controller ICs that all get the same PWM. So, use a generic component name
+# here.
+refdes = "fan_ctrl"
 
 ################################################################################
 

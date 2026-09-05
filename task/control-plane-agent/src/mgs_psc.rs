@@ -14,10 +14,12 @@ use gateway_messages::sp_impl::{
 use gateway_messages::{
     ComponentAction, ComponentActionResponse, ComponentDetails,
     ComponentUpdatePrepare, DiscoverResponse, DumpSegment, DumpTask,
+    HostBootfailPayloadData, HostInfoRequest, HostPanicPayloadData,
     IgnitionCommand, IgnitionState, MgsError, MgsRequest, MgsResponse,
-    PowerState, PowerStateTransition, RotBootInfo, RotRequest, RotResponse,
-    SensorRequest, SensorResponse, SpComponent, SpError, SpStateV2,
-    SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus, ignition,
+    PmbusStatus, PowerRailName, PowerState, PowerStateTransition, RotBootInfo,
+    RotRequest, RotResponse, SensorRequest, SensorResponse, SpComponent,
+    SpError, SpStateV2, SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
+    ignition,
 };
 use host_sp_messages::HostStartupOptions;
 use idol_runtime::{Leased, RequestError};
@@ -241,11 +243,10 @@ impl SpHandler for MgsHandler {
         &mut self,
         update: SpUpdatePrepare,
     ) -> Result<(), SpError> {
-        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::UpdatePrepare {
-            length: update.aux_flash_size + update.sp_image_size,
-            component: SpComponent::SP_ITSELF,
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::SpUpdatePrepare {
             id: update.id,
-            slot: 0,
+            aux_flash_size: update.aux_flash_size,
+            sp_image_size: update.sp_image_size,
         }));
 
         self.common.sp_update.prepare(&UPDATE_MEMORY, update)
@@ -255,12 +256,14 @@ impl SpHandler for MgsHandler {
         &mut self,
         update: ComponentUpdatePrepare,
     ) -> Result<(), SpError> {
-        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::UpdatePrepare {
-            length: update.total_size,
-            component: update.component,
-            id: update.id,
-            slot: update.slot,
-        }));
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::ComponentUpdatePrepare {
+                total_size: update.total_size,
+                component: update.component,
+                id: update.id,
+                slot: update.slot,
+            }
+        ));
 
         match update.component {
             SpComponent::ROT | SpComponent::STAGE0 => {
@@ -354,6 +357,15 @@ impl SpHandler for MgsHandler {
     fn power_state(&mut self) -> Result<PowerState, SpError> {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetPowerState));
         self.power_state_impl()
+    }
+
+    fn power_state_with_reason(
+        &mut self,
+    ) -> Result<gateway_messages::PowerStateWithReason, SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::GetPowerStateWithReason
+        ));
+        Err(SpError::RequestUnsupportedForSp)
     }
 
     fn set_power_state(
@@ -585,6 +597,14 @@ impl SpHandler for MgsHandler {
             .get_component_caboose_value(component, slot, key, buf)
     }
 
+    fn component_get_vpd(
+        &mut self,
+        component: SpComponent,
+        buf: &mut [u8],
+    ) -> Result<usize, SpError> {
+        self.common.component_get_vpd(component, buf)
+    }
+
     fn reset_component_prepare(
         &mut self,
         component: SpComponent,
@@ -700,6 +720,31 @@ impl SpHandler for MgsHandler {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetHostFlashHash {
             slot: 0
         }));
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn get_pmbus_status(
+        &mut self,
+        rail: &PowerRailName,
+    ) -> Result<PmbusStatus, SpError> {
+        self.common.get_pmbus_status(rail)
+    }
+
+    fn get_host_bootfail_payload(
+        &mut self,
+        _request: Option<HostInfoRequest>,
+        _len: u32,
+        _trailing_tx_buf: &mut [u8],
+    ) -> Result<HostBootfailPayloadData, SpError> {
+        Err(SpError::RequestUnsupportedForSp)
+    }
+
+    fn get_host_panic_payload(
+        &mut self,
+        _request: Option<HostInfoRequest>,
+        _len: u32,
+        _trailing_tx_buf: &mut [u8],
+    ) -> Result<HostPanicPayloadData, SpError> {
         Err(SpError::RequestUnsupportedForSp)
     }
 }

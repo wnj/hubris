@@ -39,6 +39,35 @@ unsafe extern "C" {
     static mut __REGION_DTCM_END: [u8; 0];
 }
 
+#[derive(Copy, Clone)]
+pub enum MeasurementResult {
+    /// [`measurement_token::SKIP`] was found in the token slot
+    ///
+    /// This indicates that an external source (typically an attached debugger)
+    /// has instructed Hubris to skip the wait-for-measurement reboot dance.
+    Skipped,
+    /// [`measurement_token::VALID`] was found in the token slot
+    ///
+    /// This indicates that the Root of Trust has measured the SP image
+    Valid { count: Option<u32> },
+    /// Hubris exceeded its retry count and booted without being measured
+    RetryCountExceeded,
+}
+
+impl MeasurementResult {
+    /// Checks whether the result represents a valid measurement
+    fn is_valid(&self) -> bool {
+        match self {
+            MeasurementResult::Valid { .. } => true,
+            MeasurementResult::Skipped
+            | MeasurementResult::RetryCountExceeded => false,
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub static mut HUBRIS_MEASUREMENT_RESULT: Option<MeasurementResult> = None;
+
 /// Check the measurement token, calling `reset_fn` to reset if needed
 ///
 /// Calls `delay_and_reset` (which diverges) if no measurement is present and we
@@ -46,7 +75,13 @@ unsafe extern "C" {
 /// measurement is valid, or `false` if we exceeded `retry_count`.
 ///
 /// `delay_and_reset` should include a delay, to give the RoT time to boot.
-pub unsafe fn check(retry_count: u32, delay_and_reset: fn() -> !) -> bool {
+///
+// TODO: `core::convert::Infallible` is used as a stand-in for `!`, we should
+// change this over when https://github.com/rust-lang/rust/pull/155499 lands.
+pub unsafe fn check<F>(retry_count: u32, delay_and_reset: F) -> bool
+where
+    F: FnOnce() -> core::convert::Infallible,
+{
     let ptr: *mut u32 = &raw mut __REGION_DTCM_BASE as *mut _;
     let end: *mut u32 = &raw mut __REGION_DTCM_END as *mut _;
     assert!(ptr == measurement_token::SP_ADDR);
@@ -63,26 +98,35 @@ pub unsafe fn check(retry_count: u32, delay_and_reset: fn() -> !) -> bool {
         (token, tag, counter, check)
     };
 
-    let out = if token == measurement_token::VALID {
-        Ok(true) // told that measurement was completed
+    let counter_valid = tag == COUNTER_TAG && tag ^ counter == check;
+    let result = if token == measurement_token::VALID {
+        // told that measurement was completed
+        let count = if counter_valid { Some(counter) } else { None };
+        Ok(MeasurementResult::Valid { count })
     } else if token == measurement_token::SKIP {
-        Ok(false) // told to skip measuring
-    } else if tag != COUNTER_TAG || tag ^ counter != check {
-        Err(0) // no counter, so initialize it
+        // told to skip measuring
+        Ok(MeasurementResult::Skipped)
+    } else if !counter_valid {
+        // no counter, so initialize it
+        Err(0)
     } else if counter >= retry_count {
-        Ok(false) // exceeded retry count, so boot
+        // exceeded retry count, so boot
+        Ok(MeasurementResult::RetryCountExceeded)
     } else {
-        Err(counter) // we should reset the processor
+        // we should reset the processor
+        Err(counter)
     };
 
-    match out {
-        Ok(v) => {
-            // Destroy the existing token
+    match result {
+        Ok(r) => {
+            // Destroy the existing token and write our global variable for
+            // later debugging.
             unsafe {
                 core::ptr::write_volatile(ptr, 0);
                 core::ptr::write_volatile(ptr.wrapping_add(1), 0);
+                HUBRIS_MEASUREMENT_RESULT = Some(r);
             }
-            v
+            r.is_valid()
         }
         Err(counter) => {
             // Increment the counter, then reset
@@ -95,7 +139,18 @@ pub unsafe fn check(retry_count: u32, delay_and_reset: fn() -> !) -> bool {
                     next ^ COUNTER_TAG,
                 );
             }
-            delay_and_reset();
+
+            // NOTE(AJM), sadly, the compiler IS smart enough to figure out that
+            // core::convert::Infallible is uninhabited, and will warn us that
+            // code following `delay_and_reset` is unreachable, BUT, it isn't
+            // smart enough to enforce this wrt types, and if we DON'T include
+            // the `unreachable!()` macro, it will tell us that it expects us to
+            // return a bool here.
+            #[allow(unreachable_code)]
+            {
+                delay_and_reset();
+                unreachable!();
+            }
         }
     }
 }

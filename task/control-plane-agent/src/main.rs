@@ -51,6 +51,7 @@ mod ignition_controller;
 task_slot!(JEFE, jefe);
 task_slot!(NET, net);
 task_slot!(SYS, sys);
+task_slot!(I2C, i2c_driver);
 
 #[allow(dead_code)] // Not all cases are used by all variants
 #[derive(Clone, Copy, PartialEq, ringbuf::Count)]
@@ -120,10 +121,15 @@ enum MgsMessage {
     },
     SerialConsoleKeepAlive,
     SerialConsoleDetach,
-    UpdatePrepare {
+    SpUpdatePrepare {
+        id: UpdateId,
+        aux_flash_size: u32,
+        sp_image_size: u32,
+    },
+    ComponentUpdatePrepare {
         component: SpComponent,
         id: UpdateId,
-        length: u32,
+        total_size: u32,
         slot: u16,
     },
     UpdateChunk {
@@ -137,6 +143,7 @@ enum MgsMessage {
         component: SpComponent,
     },
     GetPowerState,
+    GetPowerStateWithReason,
     SetPowerState(PowerState),
     Inventory,
     HostPhase2Data {
@@ -151,6 +158,9 @@ enum MgsMessage {
     GetStartupOptions,
     SetStartupOptions(gateway_messages::StartupOptions),
     ComponentDetails {
+        component: SpComponent,
+    },
+    ComponentGetVpd {
         component: SpComponent,
     },
     ComponentClearStatus {
@@ -627,3 +637,15 @@ mod idl {
 }
 
 include!(concat!(env!("OUT_DIR"), "/notifications.rs"));
+
+include!(concat!(env!("OUT_DIR"), "/i2c_config.rs"));
+
+pub(crate) mod pmbus {
+    pub struct PmbusRailBinding {
+        pub name: &'static str,
+        pub device_index: usize,
+        pub rail_index: Option<u8>,
+    }
+
+    include!(concat!(env!("OUT_DIR"), "/pmbus_mapping.rs"));
+}

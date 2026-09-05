@@ -52,7 +52,7 @@ name = "task-packrat"
 priority = 1
 start = true
 task-slots = ["jefe"]
-stacksize = 1400
+stacksize = 1520
 features = ["ereport"]
 notifications = ["task-faulted"]
 
@@ -63,6 +63,7 @@ stacksize = 6256
 start = true
 uses = ["usart1"]
 task-slots = [
+    "i2c_driver",
     "jefe",
     "net",
     "dump_agent",
@@ -205,7 +206,7 @@ features = ["vlan"]
 notifications = ["socket"]
 
 [tasks.rng_driver]
-features = ["h753", "ereport"]
+features = ["h753", "packrat"]
 task-slots = ["sys", "user_leds", "packrat"]
 
 # VLAN configuration

@@ -195,7 +195,7 @@ fn main() -> ! {
         use drv_i2c_devices::bmr491::{Bmr491, ExternalInputVoltageProtection};
 
         let dev = i2c_config::devices::bmr491_u80(I2C.get_task_id());
-        let driver = Bmr491::new(&dev, 0);
+        let driver = Bmr491::new(&dev);
 
         // Cosmo provides external undervoltage protection that kicks in at a
         // lower voltage than we'd like to tolerate, so, request additional
@@ -549,24 +549,24 @@ impl ServerImpl {
                         Ok(A0Sm::Faulted) | Err(_) => {
                             break;
                         }
-                        Ok(A0Sm::EnableGrpA) => {
-                            // hardware-cosmo#658 prevents us from checking `CPU_PRESENT`
-                            // at `A0Sm::ENABLE_GRP_A` time on rev-a boards
-                            if !cfg!(target_board = "cosmo-a") {
-                                let present =
-                                    self.sys.gpio_read(SP5_TO_SP_PRESENT_L)
-                                        == 0;
+                        // hardware-cosmo#658 prevents us from checking
+                        // `CPU_PRESENT` at `A0Sm::ENABLE_GRP_A` time on rev-a
+                        // boards
+                        Ok(A0Sm::EnableGrpA)
+                            if !cfg!(target_board = "cosmo-a") =>
+                        {
+                            let present =
+                                self.sys.gpio_read(SP5_TO_SP_PRESENT_L) == 0;
 
-                                if !present {
-                                    ringbuf_entry!(Trace::CPUNotPresent);
-                                    let _ = self.ereporter.deliver_ereport(
-                                        &ereports::cpu::CpuMissing {
-                                            cpu: &HOST_CPU_REFDES,
-                                        },
-                                    );
-                                    err = CpuSeqError::CPUNotPresent;
-                                    break;
-                                }
+                            if !present {
+                                ringbuf_entry!(Trace::CPUNotPresent);
+                                let _ = self.ereporter.deliver_ereport(
+                                    &ereports::cpu::CpuMissing {
+                                        cpu: &HOST_CPU_REFDES,
+                                    },
+                                );
+                                err = CpuSeqError::CPUNotPresent;
+                                break;
                             }
                         }
                         _ => (),

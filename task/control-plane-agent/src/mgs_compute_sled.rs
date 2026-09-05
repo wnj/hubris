@@ -17,12 +17,14 @@ use gateway_messages::sp_impl::{
 use gateway_messages::{
     ApobComponentAction, ComponentAction, ComponentActionResponse,
     ComponentDetails, ComponentUpdatePrepare, DiscoverResponse, DumpSegment,
-    DumpTask, GpioToggleCount, Header, IgnitionCommand, IgnitionState,
+    DumpTask, GpioToggleCount, Header, HostBootfailPayloadData,
+    HostInfoRequest, HostPanicPayloadData, IgnitionCommand, IgnitionState,
     LastPostCode, Message, MessageKind, MgsError, MgsRequest, MgsResponse,
-    PostCode, PowerState, PowerStateTransition, RotBootInfo, RotRequest,
-    RotResponse, SERIAL_CONSOLE_IDLE_TIMEOUT, SensorRequest, SensorResponse,
-    SpComponent, SpError, SpPort as GwSpPort, SpRequest, SpStateV2,
-    SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus, ignition,
+    PmbusStatus, PostCode, PowerRailName, PowerState, PowerStateTransition,
+    RotBootInfo, RotRequest, RotResponse, SERIAL_CONSOLE_IDLE_TIMEOUT,
+    SensorRequest, SensorResponse, SpComponent, SpError, SpPort as GwSpPort,
+    SpRequest, SpStateV2, SpUpdatePrepare, UpdateChunk, UpdateId, UpdateStatus,
+    ignition,
 };
 use heapless::{Deque, Vec};
 use host_sp_messages::HostStartupOptions;
@@ -562,11 +564,10 @@ impl SpHandler for MgsHandler {
         &mut self,
         update: SpUpdatePrepare,
     ) -> Result<(), SpError> {
-        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::UpdatePrepare {
-            length: update.aux_flash_size + update.sp_image_size,
-            component: SpComponent::SP_ITSELF,
+        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::SpUpdatePrepare {
             id: update.id,
-            slot: 0,
+            aux_flash_size: update.aux_flash_size,
+            sp_image_size: update.sp_image_size,
         }));
 
         self.common.sp_update.prepare(&UPDATE_MEMORY, update)
@@ -576,12 +577,14 @@ impl SpHandler for MgsHandler {
         &mut self,
         update: ComponentUpdatePrepare,
     ) -> Result<(), SpError> {
-        ringbuf_entry_root!(Log::MgsMessage(MgsMessage::UpdatePrepare {
-            length: update.total_size,
-            component: update.component,
-            id: update.id,
-            slot: update.slot,
-        }));
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::ComponentUpdatePrepare {
+                total_size: update.total_size,
+                component: update.component,
+                id: update.id,
+                slot: update.slot,
+            }
+        ));
 
         match update.component {
             SpComponent::HOST_CPU_BOOT_FLASH => {
@@ -712,6 +715,15 @@ impl SpHandler for MgsHandler {
     fn power_state(&mut self) -> Result<PowerState, SpError> {
         ringbuf_entry_root!(Log::MgsMessage(MgsMessage::GetPowerState));
         self.power_state_impl()
+    }
+
+    fn power_state_with_reason(
+        &mut self,
+    ) -> Result<gateway_messages::PowerStateWithReason, SpError> {
+        ringbuf_entry_root!(Log::MgsMessage(
+            MgsMessage::GetPowerStateWithReason
+        ));
+        Err(SpError::RequestUnsupportedForSp)
     }
 
     fn set_power_state(
@@ -1142,6 +1154,14 @@ impl SpHandler for MgsHandler {
             .get_component_caboose_value(component, slot, key, buf)
     }
 
+    fn component_get_vpd(
+        &mut self,
+        component: SpComponent,
+        buf: &mut [u8],
+    ) -> Result<usize, SpError> {
+        self.common.component_get_vpd(component, buf)
+    }
+
     fn reset_component_prepare(
         &mut self,
         component: SpComponent,
@@ -1258,6 +1278,106 @@ impl SpHandler for MgsHandler {
             slot
         }));
         self.host_flash_update.get_hash(slot)
+    }
+
+    fn get_host_panic_payload(
+        &mut self,
+        request: Option<HostInfoRequest>,
+        len: u32,
+        trailing_tx_buf: &mut [u8],
+    ) -> Result<HostPanicPayloadData, SpError> {
+        let max_len_usize = len as usize;
+        let max_len_usize = max_len_usize.min(trailing_tx_buf.len());
+        let dest = &mut trailing_tx_buf[..max_len_usize];
+
+        let req = request.map(|r| task_packrat_api::HostInfoRequest {
+            offset: r.offset,
+            seqno: r.seqno,
+        });
+
+        let res = self.common.packrat().read_host_panic_fragment(req, dest);
+
+        let info = res.map_err(|e| {
+            SpError::HostPanic(match e {
+                task_packrat_api::HostInfoReadError::NoHostInfo => {
+                    gateway_messages::HostPanicError::NoHostInfo
+                }
+                task_packrat_api::HostInfoReadError::InvalidOffset => {
+                    gateway_messages::HostPanicError::InvalidOffset
+                }
+                task_packrat_api::HostInfoReadError::InvalidSeqNo => {
+                    gateway_messages::HostPanicError::InvalidSeqNo
+                }
+                task_packrat_api::HostInfoReadError::MissingRestartId => {
+                    gateway_messages::HostPanicError::MissingRestartId
+                }
+                task_packrat_api::HostInfoReadError::ServerRestarted => {
+                    gateway_messages::HostPanicError::ServerRestarted
+                }
+            })
+        })?;
+
+        Ok(HostPanicPayloadData {
+            seqno: info.seqno,
+            len: info.read as usize,
+            total_len: info.total_len,
+            slot: info.slot,
+            restart_id: info.restart_id,
+        })
+    }
+
+    fn get_host_bootfail_payload(
+        &mut self,
+        request: Option<HostInfoRequest>,
+        len: u32,
+        trailing_tx_buf: &mut [u8],
+    ) -> Result<HostBootfailPayloadData, SpError> {
+        let max_len_usize = len as usize;
+        let max_len_usize = max_len_usize.min(trailing_tx_buf.len());
+        let dest = &mut trailing_tx_buf[..max_len_usize];
+
+        let req = request.map(|r| task_packrat_api::HostInfoRequest {
+            offset: r.offset,
+            seqno: r.seqno,
+        });
+
+        let res = self.common.packrat().read_host_bootfail_fragment(req, dest);
+
+        let info = res.map_err(|e| {
+            SpError::HostBootfail(match e {
+                task_packrat_api::HostInfoReadError::NoHostInfo => {
+                    gateway_messages::HostBootfailError::NoHostInfo
+                }
+                task_packrat_api::HostInfoReadError::InvalidOffset => {
+                    gateway_messages::HostBootfailError::InvalidOffset
+                }
+                task_packrat_api::HostInfoReadError::InvalidSeqNo => {
+                    gateway_messages::HostBootfailError::InvalidSeqNo
+                }
+                task_packrat_api::HostInfoReadError::MissingRestartId => {
+                    gateway_messages::HostBootfailError::MissingRestartId
+                }
+                task_packrat_api::HostInfoReadError::ServerRestarted => {
+                    gateway_messages::HostBootfailError::ServerRestarted
+                }
+            })
+        })?;
+
+        Ok(HostBootfailPayloadData {
+            seqno: info.seqno,
+            len: info.read as usize,
+            total_len: info.total_len,
+            reason: info.reason,
+            slot: info.slot,
+            restart_id: info.restart_id,
+        })
+    }
+
+    fn get_pmbus_status(
+        &mut self,
+        rail: &PowerRailName,
+    ) -> Result<PmbusStatus, SpError> {
+        self.common.get_pmbus_status(rail)
     }
 }
 
